@@ -159,7 +159,9 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
     status_placeholder.info(f"🔍 Učitavam listu restorana za **{city}**...")
 
     for page_num in range(30):
-        items_found = 0
+        count_before = len(restaurants)
+        page_has_data = False
+
         for endpoint in [
             f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={lat}&lon={lon}&skip={skip}",
             f"https://restaurant-api.wolt.com/v1/pages/delivery?lat={lat}&lon={lon}&skip={skip}",
@@ -168,6 +170,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
             if not data:
                 continue
 
+            items_in_response = 0
             for section in data.get("sections", []):
                 for item in section.get("items", []):
                     venue = item.get("venue")
@@ -175,7 +178,11 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                     
                     name = venue.get("name", "")
                     slug = venue.get("slug", "")
-                    if not name or not slug or slug in restaurants: continue
+                    if not name or not slug: continue
+
+                    items_in_response += 1  # broji sve stavke u odgovoru, i duplikate
+
+                    if slug in restaurants: continue
 
                     status = "Otvoren" if venue.get("online") else "Zatvoren"
                     rating = venue.get("rating") or {}
@@ -217,14 +224,21 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                         "link":       f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm": normalize(name),
                     }
-                    items_found += 1
 
-            if items_found > 0:
-                break
+            if items_in_response > 0:
+                page_has_data = True
+                break  # uspešno dohvaćena stranica, ne treba drugi endpoint
 
-        status_placeholder.info(f"🚴 **{city}**: Skupio {len(restaurants)} restorana. Tražim akcije...")
-        if items_found < 10:
+        new_this_page = len(restaurants) - count_before
+        status_placeholder.info(
+            f"🚴 **{city}**: Stranica {page_num+1} – +{new_this_page} novih "
+            f"(ukupno {len(restaurants)}). Tražim akcije..."
+        )
+
+        # Stajemo tek kad API vrati praznu stranicu (nema više restorana)
+        if not page_has_data:
             break
+
         skip += 40
         time.sleep(0.3)
 
