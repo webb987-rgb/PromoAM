@@ -130,11 +130,11 @@ def wolt_get(url: str, extra_headers: dict = None) -> tuple:
 
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
     """
-    Cita akcije iz discounts[] arraya u dynamic endpointu.
-    Struktura (potvrdjena u Network tabu):
-      discounts[i].banner.formatted_text  -> glavni opis
-      discounts[i].effect_item_badge.text -> kratak tag ("-20%", "Deal")
-      discounts[i].condition_badge.text   -> uslovni tag
+    Cita akcije iz dynamic endpointa.
+    Potvrdjene strukture iz Network taba:
+      sections[i].items[j].discount.formatted_text  -> "400 RSD off on orders over 1,000 RSD"
+      sections[i].items[j].applied_subtitle         -> "-20% discount on selected items..."
+      sections[i].items[j].discount.discount_id     -> identifikator kampanje
     """
     url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
@@ -147,45 +147,59 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
     akcije = set()
     ignore_texts = {
         "prikaži detalje", "show details", "vidi sve", "see all",
-        "detalji restorana", "restaurant details",
+        "detalji restorana", "restaurant details", "more", "još",
+        "schedule order", "naruči", "see menu",
     }
 
-    discounts = data.get("discounts", [])
-    for disc in discounts:
-        if not isinstance(disc, dict):
+    def add(text):
+        t = (text or "").strip()
+        if t and len(t) > 3 and t.lower() not in ignore_texts:
+            akcije.add(f"• {t}")
+
+    # Prolazi kroz sections -> items
+    for section in data.get("sections", []):
+        if not isinstance(section, dict):
             continue
+        for item in section.get("items", []):
+            if not isinstance(item, dict):
+                continue
 
-        banner = disc.get("banner") or {}
-        main_text = (banner.get("formatted_text") or "").strip()
+            # 1. discount.formatted_text  (npr. "400 RSD off on orders over 1,000 RSD")
+            discount = item.get("discount") or {}
+            add(discount.get("formatted_text"))
 
-        eff_badge = disc.get("effect_item_badge") or {}
-        badge_text = (eff_badge.get("text") or "").strip()
+            # 2. applied_subtitle  (npr. "-20% discount on selected items will be deducted at the checkout")
+            add(item.get("applied_subtitle"))
 
-        cond_badge = disc.get("condition_badge") or {}
-        cond_text = (cond_badge.get("text") or "").strip()
+            # 3. title / description na samom itemu
+            add(item.get("title"))
+            add(item.get("description"))
 
-        best = main_text or badge_text or cond_text
-        if not best or best.lower() in ignore_texts or len(best) <= 2:
-            continue
+            # 4. badge tekstovi
+            for badge_key in ("badge", "label_badge", "item_badge"):
+                badge = item.get(badge_key) or {}
+                if isinstance(badge, dict):
+                    add(badge.get("text"))
+                elif isinstance(badge, str):
+                    add(badge)
 
-        if main_text and badge_text and badge_text.lower() not in main_text.lower():
-            akcije.add(f"• [{badge_text}] {main_text}")
-        else:
-            akcije.add(f"• {best}")
-
-    # Fallback na stari nacin ako nema discounts kljuca
+    # Fallback: stari rekurzivni scan ako sections nista nije dao
     if not akcije:
-        def _scan(obj):
+        seen = set()
+        def _scan(obj, depth=0):
+            if depth > 8:
+                return
             if isinstance(obj, dict):
-                for k in ("formatted_text", "title"):
+                for k in ("formatted_text", "applied_subtitle", "title"):
                     t = (obj.get(k) or "").strip()
-                    if t and t.lower() not in ignore_texts and len(t) > 3:
+                    if t and len(t) > 4 and t.lower() not in ignore_texts and t not in seen:
+                        seen.add(t)
                         akcije.add(f"• {t}")
                 for v in obj.values():
-                    _scan(v)
+                    _scan(v, depth + 1)
             elif isinstance(obj, list):
                 for i in obj:
-                    _scan(i)
+                    _scan(i, depth + 1)
         _scan(data)
 
     return list(akcije)
