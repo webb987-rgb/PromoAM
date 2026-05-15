@@ -6,6 +6,7 @@ import smtplib
 import requests
 import pandas as pd
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -34,10 +35,6 @@ st.markdown("""
            box-shadow:0 2px 8px rgba(0,0,0,0.07); text-align:center; }
     .kpi-val { font-size:2.2rem; font-weight:800; color:#009de0; }
     .kpi-lbl { font-size:.85rem; color:#888; margin-top:4px; }
-    .promo-badge { display:inline-block; background:#fff3cd; color:#856404;
-                   border-radius:6px; padding:2px 10px; font-size:.8rem;
-                   margin:2px; border:1px solid #ffc10740; }
-    .no-promo { color:#bbb; font-style:italic; }
     div[data-testid="stDataFrame"] thead th { background:#009de0!important; color:#fff!important; }
 </style>
 """, unsafe_allow_html=True)
@@ -85,15 +82,14 @@ def append_alert_log(rows: list):
 # ─────────────────────────── WOLT API & SESSION ──────────────────────────────
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "sr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://wolt.com",
     "Referer": "https://wolt.com/",
 }
 
-# Kreiramo perzistentnu sesiju kako bi kolačići opstali kroz zahteve
+# Perzistentna sesija da izbegnemo blokade
 session = requests.Session()
 session.headers.update(BROWSER_HEADERS)
 
@@ -112,7 +108,6 @@ CITY_SLUG_MAP = {
 }
 
 def wolt_get(url: str) -> dict | None:
-    """Stabilniji GET zahtev koji koristi deljenu sesiju."""
     try:
         r = session.get(url, timeout=15)
         if r.status_code == 200:
@@ -121,15 +116,46 @@ def wolt_get(url: str) -> dict | None:
         pass
     return None
 
+def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
+    """Dubinska pretraga za 'formatted_text' unutar dynamic endpoint-a."""
+    url = (
+        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
+        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
+    )
+    data = wolt_get(url)
+    if not data:
+        return []
+
+    akcije = set()
+
+    # Rekurzivna funkcija koja traži tvoj JSON format bilo gde u kodu
+    def _extract(obj):
+        if isinstance(obj, dict):
+            # OVO JE KLJUČ IZ TVOG JSON-a
+            text = obj.get("formatted_text") or obj.get("text") or obj.get("title")
+            if text and isinstance(text, str) and len(text) > 3:
+                t_lower = text.lower()
+                # Filtriramo samo one tekstove koji liče na akciju
+                if any(keyword in t_lower for keyword in ["popust", "%", "gratis", "rsd", "akcija", "uštedi", "besplatn"]):
+                    akcije.add(f"• {text.strip()}")
+            
+            for v in obj.values():
+                _extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract(item)
+
+    _extract(data)
+    return list(akcije)
+
 def fetch_city(city: str, status_placeholder) -> list[dict]:
-    """Skenira grad i odmah izvlači bedževe (akcije) iz Feed API-ja."""
     city_slug = CITY_SLUG_MAP.get(city, normalize(city).replace(" ", "-"))
     lat, lon  = CITY_COORDS.get(city, (44.8178, 20.4569))
 
     restaurants = {}
     skip = 0
 
-    status_placeholder.info(f"🔍 Učitavam listu restorana i akcije za **{city}**...")
+    status_placeholder.info(f"🔍 Učitavam listu restorana za **{city}**...")
 
     for page_num in range(30):
         items_found = 0
@@ -144,13 +170,11 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
             for section in data.get("sections", []):
                 for item in section.get("items", []):
                     venue = item.get("venue")
-                    if not venue:
-                        continue
+                    if not venue: continue
                     
                     name = venue.get("name", "")
                     slug = venue.get("slug", "")
-                    if not name or not slug or slug in restaurants:
-                        continue
+                    if not name or not slug or slug in restaurants: continue
 
                     status = "Otvoren" if venue.get("online") else "Zatvoren"
                     rating = venue.get("rating") or {}
@@ -158,30 +182,25 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                     est = venue.get("estimate_range") or venue.get("estimate")
                     delivery_time = f"{est} min" if est else "-"
 
-                    # ─────────────────────────────────────────────────────────
-                    # Čitamo SVE bedževe direktno iz feed-a
-                    # ─────────────────────────────────────────────────────────
+                    # 1. Osnovni bedževi sa feed-a i "NOVO" logika
                     akcije_lista = []
-                    
-                    # 1. Provera 'badges' niza (npr. [{'text': '-20%'}, {'text': 'Wolt+'}])
+                    novo_status = "Ne"
+
                     badges = venue.get("badges", [])
                     for badge in badges:
                         txt = badge.get("text", "")
                         if txt:
-                            akcije_lista.append(f"• {txt}")
+                            if txt.lower() in ["novo", "new"]:
+                                novo_status = "Da"
+                            elif "%" in txt or "popust" in txt.lower():
+                                akcije_lista.append(f"• {txt}")
 
-                    # 2. Ponekad stave popust u 'label' ili 'short_description'
                     label = venue.get("label", "")
                     if label:
-                        akcije_lista.append(f"• {label}")
-                        
-                    short_desc = venue.get("short_description", "")
-                    if short_desc and any(k in short_desc.lower() for k in ["%", "popust", "rsd", "gratis", "akcija"]):
-                        akcije_lista.append(f"• Info: {short_desc}")
-
-                    # Uklanjamo duplikate i spajamo sve bedževe u jedan string
-                    # Ako lista nije prazna spoji ih, u suprotnom stavi "-"
-                    akcije_str = "\n".join(sorted(set(akcije_lista))) if akcije_lista else "-"
+                        if label.lower() in ["novo", "new"]:
+                            novo_status = "Da"
+                        elif "%" in label or "popust" in label.lower():
+                            akcije_lista.append(f"• {label}")
 
                     restaurants[slug] = {
                         "grad":       city,
@@ -190,39 +209,61 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                         "status":     status,
                         "ocena":      str(rating_score),
                         "dostava":    delivery_time,
-                        "akcije":     akcije_str,
+                        "novo":       novo_status,
+                        "akcije_feed": akcije_lista,  # Čuvamo ovo za kasnije spajanje
                         "link":       f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm": normalize(name),
                     }
                     items_found += 1
 
             if items_found > 0:
-                break  # Uspešno smo učitali podatke sa ovog endpointa, ne idi na sledeći
+                break
 
-        status_placeholder.info(
-            f"🚴 **{city}**: {len(restaurants)} restorana skenirano (stranica {page_num + 1})"
-        )
-        
-        # Ako je našao manje od 10 novih restorana na stranici, to znači da smo stigli do kraja liste
+        status_placeholder.info(f"🚴 **{city}**: Skupio {len(restaurants)} restorana. Tražim akcije...")
         if items_found < 10:
             break
-            
         skip += 40
-        time.sleep(0.5)  # Mala pauza da nas ne blokiraju
+        time.sleep(0.3)
 
     if not restaurants:
         status_placeholder.warning(f"⚠️ **{city}**: nije pronađen nijedan restoran.")
         return []
 
-    return list(restaurants.values())
+    # 2. Kopanje po "Ponude i Pogodnosti" za svaki restoran (sa limitom od 5 radnika)
+    slugs = list(restaurants.keys())
+    total = len(slugs)
+    progress_text = f"🎯 Učitavam detaljne akcije za {city}..."
+    progress_bar = st.progress(0, text=progress_text)
+    
+    completed = 0
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(fetch_dynamic_discounts, slug, lat, lon): slug for slug in slugs}
+        for fut in as_completed(futures):
+            slug = futures[fut]
+            dynamic_akcije = fut.result()
+            
+            # Spajamo feed bedževe i detaljne akcije (uklanjamo duplikate)
+            sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
+            restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
+            
+            completed += 1
+            if completed % 5 == 0 or completed == total:
+                progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
 
+    progress_bar.empty()
+    
+    # Brisanje pomoćnog ključa pre nego što ga vratimo
+    for r in restaurants.values():
+        r.pop("akcije_feed", None)
+
+    return list(restaurants.values())
 
 def scan_all_cities(selected_cities: list[str], status_placeholder) -> pd.DataFrame:
     all_rows = []
     for i, city in enumerate(selected_cities):
         rows = fetch_city(city, status_placeholder)
         all_rows.extend(rows)
-        status_placeholder.success(f"✅ {city}: {len(rows)} restorana | Ukupno: {len(all_rows)}")
+        status_placeholder.success(f"✅ {city} završen!")
         if i < len(selected_cities) - 1:
             time.sleep(1)
     status_placeholder.empty()
@@ -330,7 +371,7 @@ with tab_scan:
 
     if run_scan and selected_cities:
         ph = st.empty()
-        with st.spinner("Skeniranje u toku..."):
+        with st.spinner("Skeniranje u toku (ovo može potrajati minut-dva zbog detaljnih akcija)..."):
             df = scan_all_cities(selected_cities, ph)
         if not df.empty:
             st.session_state.df_wolt = df
@@ -348,13 +389,13 @@ with tab_scan:
         total = len(df)
         sa_akcijama = len(df[df["akcije"] != "-"])
         otvoreni = len(df[df["status"] == "Otvoren"])
-        gradovi = df["grad"].nunique()
+        novi = len(df[df["novo"] == "Da"])
 
         for col, val, lbl in [
             (k1, total,       "Ukupno restorana"),
             (k2, sa_akcijama, "Sa aktivnim akcijama"),
             (k3, otvoreni,    "Trenutno otvoreno"),
-            (k4, gradovi,     "Gradova"),
+            (k4, novi,        "Novih restorana"),
         ]:
             with col:
                 st.markdown(f"""
@@ -365,23 +406,27 @@ with tab_scan:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        fc1, fc2, fc3 = st.columns(3)
+        fc1, fc2, fc3, fc4 = st.columns(4)
         with fc1:
             grad_filter = st.multiselect("Grad:", CITIES, default=CITIES, key="scan_grad")
         with fc2:
             samo_akcije = st.checkbox("📌 Samo sa akcijama", value=False, key="scan_akcije")
         with fc3:
+            samo_novi = st.checkbox("🆕 Samo NOVI", value=False, key="scan_novi")
+        with fc4:
             search = st.text_input("🔎 Pretraži naziv:", key="scan_search")
 
         fdf = df[df["grad"].isin(grad_filter)]
         if samo_akcije:
             fdf = fdf[fdf["akcije"] != "-"]
+        if samo_novi:
+            fdf = fdf[fdf["novo"] == "Da"]
         if search.strip():
             fdf = fdf[fdf["naziv"].str.contains(search.strip(), case=False, na=False)]
 
         st.caption(f"Prikazano: **{len(fdf)}** restorana")
 
-        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "akcije", "link"]
+        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "akcije", "link"]
         st.dataframe(
             fdf[display_cols].reset_index(drop=True),
             use_container_width=True,
@@ -393,6 +438,7 @@ with tab_scan:
                 "status":  st.column_config.TextColumn("Status"),
                 "ocena":   st.column_config.TextColumn("Ocena"),
                 "dostava": st.column_config.TextColumn("Dostava"),
+                "novo":    st.column_config.TextColumn("Novi"),
                 "akcije":  st.column_config.TextColumn("Akcije", width="large"),
                 "link":    st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
             },
