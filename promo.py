@@ -1,32 +1,39 @@
+import streamlit as st
 import asyncio
-import datetime
-import os
-import re
-import smtplib
-import pandas as pd
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from playwright.async_api import async_playwright
 import os
 import subprocess
+import pandas as pd
+import datetime
+import smtplib
+import re
+import json
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-# Instalacija browsera ako nisu prisutni (bitno za Streamlit Cloud)
-try:
-    import playwright
-except ImportError:
-    os.system("pip install playwright")
+# --- 1. INSTALACIJA ZAVISNOSTI (Rešenje za beli ekran) ---
+@st.cache_resource
+def install_playwright_stuff():
+    try:
+        # Instalacija Chromiuma i sistemskih zavisnosti
+        subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
+        subprocess.run(["python", "-m", "playwright", "install-deps"], check=True)
+        return True
+    except Exception as e:
+        st.error(f"Greška pri instalaciji Playwright-a: {e}")
+        return False
 
-# Komanda koja instalira Chromium browser
-subprocess.run(["playwright", "install", "chromium"])
+with st.spinner("Inicijalizacija sistema..."):
+    install_playwright_stuff()
 
-# ================= KONFIGURACIJA =================
+# Tek nakon instalacije uvozimo Playwright
+from playwright.async_api import async_playwright
+
+# --- 2. KONFIGURACIJA ---
 EMAIL_SENDER = "webb987@gmail.com"
 EMAIL_PASSWORD = "sdehqzbnqefjlomo"
-# Dodaj ovde prave mejlove tvojih Account Managera
-RECIPIENTS = ["am_beograd@glovo.com", "am_nis@glovo.com"] 
+RECIPIENTS = ["manager1@glovo.com"] # DODAJ PRAVE MEJLOVE OVDE
 
-GLOVO_AUTH = "glovo_auth.json" # Mora postojati u istom folderu
-WOLT_AUTH = "wolt_auth.json"   # Opciono
+GLOVO_AUTH = "glovo_auth.json"
 
 CITIES = {
     "Beograd": {"lat": 44.8125, "lon": 20.4612, "address": "Makenzijeva 57, Beograd"},
@@ -35,182 +42,155 @@ CITIES = {
     "Kragujevac": {"lat": 44.0128, "lon": 20.9114, "address": "Centar, Kragujevac"}
 }
 
-# ================= POMOĆNE FUNKCIJE =================
+# --- 3. POMOĆNE FUNKCIJE ---
 def normalize_name(name):
-    # Uklanja razmake i specijalne karaktere radi lakšeg poređenja
     return re.sub(r'[^\w]', '', str(name).lower())
 
 def send_sales_email(df_gaps):
     if df_gaps.empty:
-        print("Nema pronađenih promo propusta za danas.")
         return
-
+    
     subject = f"🔴 SALES ALERT: Promo Gaps na Woltu ({datetime.date.today().strftime('%d.%m.%Y')})"
+    html_table = df_gaps.to_html(index=False, escape=False, border=0)
     
-    # Kreiranje HTML tabele za mejl
-    html_table = df_gaps.to_html(index=False, border=0, classes='promo-table')
-    
-    # Moderniji stil za mejl
     style = """
     <style>
-        .promo-table { border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; }
-        .promo-table td, .promo-table th { border: 1px solid #ddd; padding: 12px; }
-        .promo-table th { background-color: #ffc244; color: black; text-align: left; }
-        .promo-table tr:nth-child(even) { background-color: #f2f2f2; }
-        .wolt-promo { color: #00c2e8; font-weight: bold; }
+        table { border-collapse: collapse; width: 100%; font-family: sans-serif; }
+        th { background-color: #ffc244; padding: 10px; text-align: left; }
+        td { border-bottom: 1px solid #ddd; padding: 10px; }
+        .wolt { color: #00c2e8; font-weight: bold; }
         .urgency { color: #e74c3c; font-weight: bold; }
     </style>
     """
 
     msg = MIMEMultipart()
+    msg['Subject'] = subject
     msg['From'] = EMAIL_SENDER
     msg['To'] = ", ".join(RECIPIENTS)
-    msg['Subject'] = subject
 
-    body = f"""
-    <html>
-    <head>{style}</head>
-    <body>
-        <h2>Izveštaj o propuštenim akcijama</h2>
-        <p>Sledeći restorani imaju aktivne promocije na <b>Wolt-u</b>, dok su na <b>Glovo</b> platformi bez akcije:</p>
-        {html_table}
-        <br>
-        <p><i>Ovaj izveštaj je generisan automatski. Proverite uslove pre kontaktiranja partnera.</i></p>
-    </body>
-    </html>
-    """
+    body = f"<html><head>{style}</head><body><h3>Propusti u promocijama</h3>{html_table}</body></html>"
     msg.attach(MIMEText(body, 'html'))
 
-    try:
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print("Mejl uspešno poslat.")
-    except Exception as e:
-        print(f"Greška pri slanju mejla: {e}")
+    with smtplib.SMTP('smtp.gmail.com', 587) as server:
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
 
-# ================= SCRAPERI =================
-
-async def scrape_wolt_city(context, city_name, coords):
-    """Munjevito izvlačenje Wolt promocija putem API-ja"""
+# --- 4. SCRAPER LOGIKA ---
+async def get_wolt_promos(context, coords):
     page = await context.new_page()
     lat, lon = coords['lat'], coords['lon']
+    url = f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={lat}&lon={lon}"
     
-    # 1. Fetch osnovnog feed-a
-    feed_url = f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={lat}&lon={lon}"
-    await page.goto(feed_url)
-    content = await page.inner_text("body")
+    await page.goto(url)
+    raw_data = await page.inner_text("body")
+    data = json.loads(raw_data)
     
-    import json
-    data = json.loads(content)
-    venues = []
+    results = {}
+    slugs = []
+    venues_map = {}
+
     for section in data.get("sections", []):
         for item in section.get("items", []):
             if "venue" in item:
-                venues.append(item["venue"])
-    
-    # 2. JS Requester za dubinsku provere akcija (iz tvog originalnog koda)
-    promo_results = {}
-    slugs = [v["slug"] for v in venues[:100]] # Prvih 100 restorana radi stabilnosti
-    
-    js_promo_check = """
+                v = item["venue"]
+                slugs.append(v["slug"])
+                venues_map[v["slug"]] = v["name"]
+
+    # Dubinski JS check za popuste
+    js_check = """
     async (slugs, lat, lon) => {
-        let results = {};
-        for (let slug of slugs) {
+        let res = {};
+        for (let s of slugs.slice(0, 80)) {
             try {
-                let url = `https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/${slug}/dynamic/?lat=${lat}&lon=${lon}`;
-                let r = await fetch(url);
+                let r = await fetch(`https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/${s}/dynamic/?lat=${lat}&lon=${lon}`);
                 if (r.ok) {
                     let d = await r.json();
-                    let p = [];
-                    (d.discounts || []).forEach(x => p.push(x.description?.title || "Popust"));
-                    results[slug] = p.join(", ");
+                    let p = (d.discounts || []).map(x => x.description?.title || "Popust");
+                    res[s] = p.length > 0 ? p.join(", ") : "-";
                 }
             } catch(e) {}
         }
-        return results;
+        return res;
     }
     """
-    api_promos = await page.evaluate(f"({js_promo_check})({slugs}, {lat}, {lon})")
+    promo_data = await page.evaluate(f"({js_check})({slugs}, {lat}, {lon})")
     
-    final_data = {}
-    for v in venues:
-        name_norm = normalize_name(v["name"])
-        promo_text = api_promos.get(v["slug"], "-")
-        # Ako API nije vratio, proveri da li je bilo šta u bazičnom feed-u
-        if promo_text == "-" and "Wolt+" in str(v): promo_text = "Wolt+ Exclusive"
-        
-        final_data[name_norm] = {"Name": v["name"], "Promo": promo_text}
+    for slug, p_text in promo_data.items():
+        results[normalize_name(venues_map[slug])] = {"Name": venues_map[slug], "Promo": p_text}
     
     await page.close()
-    return final_data
+    return results
 
-async def scrape_glovo_city(context, address):
-    """Izvlačenje Glovo promocija koristeći login sesiju"""
+async def get_glovo_promos(context, address):
     page = await context.new_page()
-    try:
-        await page.goto("https://glovoapp.com/sr/rs", timeout=30000)
-        # Navigacija do adrese (tvoj originalni metod)
-        # ... (Ovde ide tvoj kod za unos adrese i smart scroll)
-        
-        # Pojednostavljena logika za potrebe sales izveštaja
-        # Vraćamo rečnik: { "restoran_norm": "Ima/Nema" }
-        promos = await page.evaluate("""() => {
-            let res = {};
-            document.querySelectorAll("a[data-testid='store-card']").forEach(card => {
-                let name = card.querySelector('h3')?.innerText || "";
-                let hasPromo = !!card.querySelector('[data-style="promotion"]');
-                if(name) res[name] = hasPromo ? "Ima" : "-";
-            });
-            return res;
-        }""")
-        
-        final_glovo = {normalize_name(k): v for k, v in promos.items()}
-        return final_glovo
-    except:
-        return {}
-    finally:
-        await page.close()
+    # Ovde koristimo bazični scan prodavnica
+    await page.goto("https://glovoapp.com/sr/rs")
+    # Napomena: Za punu navigaciju do adrese koristi se tvoj raniji kod sa hero-container-input
+    # Za ovaj primer koristimo scrape vidljivih elemenata
+    promos = await page.evaluate("""() => {
+        let items = {};
+        document.querySelectorAll("a[data-testid='store-card']").forEach(c => {
+            let n = c.querySelector('h3')?.innerText || "";
+            let hasP = !!c.querySelector('[data-style="promotion"]');
+            if(n) items[n] = hasP ? "Ima" : "-";
+        });
+        return items;
+    }""")
+    await page.close()
+    return {normalize_name(k): v for k, v in promos.items()}
 
-# ================= GLAVNI PROCES =================
+# --- 5. STREAMLIT INTERFEJS ---
+st.set_page_config(page_title="Sales Promo Tool", page_icon="🎯")
 
-async def main():
+if "scanning" not in st.session_state:
+    st.session_state.scanning = False
+
+async def start_scan():
+    st.session_state.scanning = True
+    all_gaps = []
+    
     async with async_playwright() as p:
-        # Pokrećemo browser sa tvojim podešavanjima
         browser = await p.chromium.launch(headless=True)
+        # Učitavanje Glovo sesije
+        storage = GLOVO_AUTH if os.path.exists(GLOVO_AUTH) else None
+        context = await browser.new_context(storage_state=storage)
         
-        # Učitavamo tvoje sesije (auth fajlove)
-        glovo_context = await browser.new_context(storage_state=GLOVO_AUTH if os.path.exists(GLOVO_AUTH) else None)
-        wolt_context = await browser.new_context(storage_state=WOLT_AUTH if os.path.exists(WOLT_AUTH) else None)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        all_gaps = []
-
-        for city, info in CITIES.items():
-            print(f"🔄 Proveravam {city}...")
+        for i, (city, info) in enumerate(CITIES.items()):
+            status_text.text(f"Skeniram grad: {city}...")
+            w_data = await get_wolt_promos(context, info)
+            g_data = await get_glovo_promos(context, info["address"])
             
-            wolt_res = await scrape_wolt_city(wolt_context, city, info)
-            glovo_res = await scrape_glovo_city(glovo_context, info["address"])
-            
-            # Poređenje podataka
-            for norm_name, w_info in wolt_res.items():
-                if w_info["Promo"] != "-" and norm_name in glovo_res:
-                    if glovo_res[norm_name] == "-":
+            for norm_name, w_info in w_data.items():
+                if w_info["Promo"] != "-" and norm_name in g_data:
+                    if g_data[norm_name] == "-":
                         all_gaps.append({
                             "Grad": city,
                             "Restoran": w_info["Name"],
-                            "Wolt Akcija": f"<span class='wolt-promo'>{w_info['Promo']}</span>",
-                            "Glovo Status": "<span class='urgency'>NEMA AKCIJU</span>"
+                            "Wolt Akcija": f"<span class='wolt'>{w_info['Promo']}</span>",
+                            "Glovo": "<span class='urgency'>Bez akcije ❌</span>"
                         })
+            progress_bar.progress((i + 1) / len(CITIES))
         
-        # Slanje rezultata
-        if all_gaps:
-            df = pd.DataFrame(all_gaps)
-            send_sales_email(df)
-        else:
-            print("Nema propusta u promocijama.")
-
         await browser.close()
+    
+    df = pd.DataFrame(all_gaps)
+    if not df.empty:
+        st.subheader("Pronađeni Sales Gap-ovi")
+        st.write(df.to_html(escape=False), unsafe_allow_html=True)
+        if st.button("Pošalji izveštaj Account Managerima"):
+            send_sales_email(df)
+            st.success("Mejl poslat!")
+    else:
+        st.info("Nisu pronađeni propusti u promocijama.")
+    
+    st.session_state.scanning = False
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if st.button("🚀 POKRENI DNEVNU ANALIZU (SVI GRADOVI)") and not st.session_state.scanning:
+    asyncio.run(start_scan())
+
+st.sidebar.markdown("---")
+st.sidebar.info("Ova skripta proverava BG, NS, NI i KG u 09:00h i traži restorane koji su 'zaboravili' akciju na Glovu.")
