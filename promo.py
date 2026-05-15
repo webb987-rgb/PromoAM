@@ -97,52 +97,26 @@ BROWSER_HEADERS = {
     "Referer": "https://wolt.com/",
 }
 
-# ─── Wolt session (jednom inicijalizovana, drži guest cookies) ────────────────
-@st.cache_resource(show_spinner=False)
-def get_wolt_session() -> requests.Session:
-    """
-    Kreira requests.Session koja posećuje wolt.com da dobije guest cookies,
-    a onda može da poziva consumer-api endpointe koji zahtevaju autentikaciju.
-    """
-    s = requests.Session()
-    s.headers.update(BROWSER_HEADERS)
-    try:
-        # 1. Poseti homepage da dobiješ session + guest token
-        s.get("https://wolt.com/en/srb", timeout=15, allow_redirects=True)
-        time.sleep(0.5)
-        # 2. Poseti API jednom da aktiviraš guest sesiju
-        s.get(
-            "https://restaurant-api.wolt.com/v1/pages/restaurants?lat=44.817&lon=20.456&skip=0",
-            timeout=15,
-        )
-    except Exception:
-        pass
-    return s
+# Hardkodirane koordinate – nema potrebe za geocodingom
+CITY_COORDS = {
+    "Beograd":    (44.8178, 20.4569),
+    "Novi Sad":   (45.2671, 19.8335),
+    "Niš":        (43.3209, 21.8958),
+    "Kragujevac": (44.0128, 20.9114),
+}
 
-
-def geocode(city: str) -> tuple[float, float] | None:
-    """Nominatim geocoding – vraća (lat, lon) ili None."""
-    url = (
-        "https://nominatim.openstreetmap.org/search"
-        f"?q={urllib.parse.quote(city + ', Serbia')}&format=json&limit=1"
-    )
-    try:
-        s = get_wolt_session()
-        r = s.get(url, headers={"User-Agent": "PromoMonitor/1.0 (contact@example.com)"},
-                  timeout=10)
-        data = r.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception:
-        pass
-    return None
+CITY_SLUG_MAP = {
+    "Beograd":    "belgrade",
+    "Novi Sad":   "novi-sad",
+    "Niš":        "nis",
+    "Kragujevac": "kragujevac",
+}
 
 
 def wolt_get(url: str) -> dict | None:
-    """GET kroz autentifikovanu sesiju."""
+    """Jednostavan GET sa browser headerima."""
     try:
-        s = get_wolt_session()
-        r = s.get(url, timeout=15)
+        r = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -152,9 +126,8 @@ def wolt_get(url: str) -> dict | None:
 
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
     """
-    Poziva Wolt dynamic endpoint koji vraća venue-level akcije
-    (isto što se vidi u 'Deals & benefits' na stranici restorana).
-    Koristi autentifikovanu sesiju sa guest cookijima.
+    Poziva Wolt dynamic endpoint – venue-level akcije
+    (ono što se vidi u 'Deals & benefits' na stranici restorana).
     """
     url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
@@ -168,7 +141,6 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
 
     def _read(obj):
         if isinstance(obj, dict):
-            # Direktno čitamo discount blokove
             for disc in obj.get("discounts", []):
                 _extract_title(disc)
             for badge in obj.get("badges", []):
@@ -197,7 +169,6 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
             t = str(t or "").strip()
             if len(t) < 3 or t.lower() in seen:
                 continue
-            # Preskoči čisto numeričke vrednosti i interne Wolt+ kampanje
             if re.match(r"^\d+$", t):
                 continue
             seen.add(t.lower())
@@ -206,7 +177,7 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
 
     _read(data)
 
-    # Fallback regex za % i RSD popuste ako API nije vratio strukturirane podatke
+    # Fallback regex
     if not res:
         raw = json.dumps(data)
         for pct in re.findall(r'(\d{1,3}\s*%\s*(?:off|popust|discount))', raw, re.I):
@@ -225,10 +196,7 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
 
 
 def fetch_menu_discounts(slug: str) -> str | None:
-    """
-    Proverava meni restorana za item-level popuste (precrtane cene).
-    Vraća opis ako postoje, None ako nema.
-    """
+    """Proverava meni za precrtane cene (item-level popusti)."""
     url = f"https://restaurant-api.wolt.com/v4/venues/slug/{slug}/menu?unit_prices=true"
     data = wolt_get(url)
     if not data:
@@ -253,28 +221,15 @@ def fetch_menu_discounts(slug: str) -> str | None:
 def fetch_city(city: str, status_placeholder) -> list[dict]:
     """Skenira jedan grad: feed API za listu + dynamic endpoint za akcije."""
 
-    CITY_SLUG_MAP = {
-        "Beograd":    "belgrade",
-        "Novi Sad":   "novi-sad",
-        "Niš":        "nis",
-        "Kragujevac": "kragujevac",
-    }
     city_slug = CITY_SLUG_MAP.get(city, normalize(city).replace(" ", "-"))
+    lat, lon  = CITY_COORDS.get(city, (44.8178, 20.4569))
 
-    status_placeholder.info(f"📍 Geocodiram **{city}**...")
-    coords = geocode(city)
-    if not coords:
-        status_placeholder.error(f"❌ Ne mogu da nađem koordinate za {city}")
-        return []
-
-    lat, lon = coords
     restaurants = {}
     skip = 0
-    max_pages = 30
 
     status_placeholder.info(f"🔍 Učitavam listu restorana za **{city}**...")
 
-    for page_num in range(max_pages):
+    for page_num in range(30):
         items_found = 0
         for endpoint in [
             f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={lat}&lon={lon}&skip={skip}",
@@ -314,23 +269,24 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                     items_found += 1
 
             if items_found > 0:
-                break
+                break  # uspešan endpoint
 
         status_placeholder.info(
-            f"🚴 **{city}**: {len(restaurants)} restorana učitano (stranica {page_num + 1})"
+            f"🚴 **{city}**: {len(restaurants)} restorana (stranica {page_num + 1})"
         )
         if items_found < 10:
             break
         skip += 40
-        time.sleep(0.3)
+        time.sleep(0.2)
 
     if not restaurants:
+        status_placeholder.warning(f"⚠️ **{city}**: nije pronađen nijedan restoran.")
         return []
 
-    # ── Korak 2: Konkurentno učitavamo akcije za svaki restoran ──────────────
+    # ── Korak 2: Konkurentno učitavamo akcije ────────────────────────────────
     slugs = list(restaurants.keys())
     total = len(slugs)
-    status_placeholder.info(f"🎯 **{city}**: Učitavam akcije za {total} restorana...")
+    status_placeholder.info(f"🎯 **{city}**: učitavam akcije za {total} restorana...")
     progress = st.progress(0, text=f"0 / {total}")
 
     def _fetch_one(slug):
@@ -351,6 +307,18 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
 
     progress.empty()
     return list(restaurants.values())
+
+
+def scan_all_cities(selected_cities: list[str], status_placeholder) -> pd.DataFrame:
+    all_rows = []
+    for i, city in enumerate(selected_cities):
+        rows = fetch_city(city, status_placeholder)
+        all_rows.extend(rows)
+        status_placeholder.success(f"✅ {city}: {len(rows)} restorana | Ukupno: {len(all_rows)}")
+        if i < len(selected_cities) - 1:
+            time.sleep(1)
+    status_placeholder.empty()
+    return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
 
 def scan_all_cities(progress_placeholder) -> pd.DataFrame:
@@ -445,21 +413,41 @@ tab_scan, tab_amm, tab_alert, tab_stats = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_scan:
     st.markdown("### 🔍 Wolt scan")
-    st.markdown(f"Gradovi: **{', '.join(CITIES)}**")
+
+    # ── Izbor gradova ─────────────────────────────────────────────────────────
+    selected_cities = st.multiselect(
+        "📍 Gradovi za skeniranje:",
+        options=CITIES,
+        default=CITIES,
+        key="selected_cities",
+    )
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
-        run_scan = st.button("▶️ Pokreni scan", type="primary", use_container_width=True)
+        run_scan = st.button(
+            "▶️ Pokreni scan", type="primary",
+            use_container_width=True,
+            disabled=not selected_cities,
+        )
     with col_info:
         if st.session_state.last_scan:
             st.info(f"⏱️ Poslednji scan: **{st.session_state.last_scan}**  |  "
                     f"Ukupno restorana: **{len(st.session_state.df_wolt)}**")
+        if not selected_cities:
+            st.warning("Izaberi bar jedan grad.")
 
-    if run_scan:
+    if run_scan and selected_cities:
         ph = st.empty()
         with st.spinner("Skeniranje u toku..."):
-            df = scan_all_cities(ph)
+            df = scan_all_cities(selected_cities, ph)
         if not df.empty:
+            st.session_state.df_wolt = df
+            st.session_state.last_scan = local_now()
+            st.success(f"✅ Scan završen! Pronađeno **{len(df)}** restorana.")
+            st.rerun()
+        else:
+            st.error("❌ Scan nije vratio podatke. Proveri internet konekciju.")
+
             st.session_state.df_wolt = df
             st.session_state.last_scan = local_now()
             st.success(f"✅ Scan završen! Pronađeno **{len(df)}** restorana.")
