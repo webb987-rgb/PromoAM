@@ -87,6 +87,8 @@ BROWSER_HEADERS = {
     "Accept-Language": "sr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://wolt.com",
     "Referer": "https://wolt.com/",
+    "W-PlatformType": "Web",
+    "W-Wolt-Session-Id": "wolt-monitor-session",
 }
 
 # Perzistentna sesija da izbegnemo blokade
@@ -107,46 +109,79 @@ CITY_SLUG_MAP = {
     "Kragujevac": "kragujevac",
 }
 
-def wolt_get(url: str) -> dict | None:
+def wolt_get(url: str, extra_headers: dict = None) -> tuple:
+    """Vraca (json_data, status_code). json_data je None ako nije 200."""
     try:
-        r = session.get(url, timeout=15)
+        hdrs = {}
+        if extra_headers:
+            hdrs.update(extra_headers)
+        r = session.get(url, timeout=15, headers=hdrs)
         if r.status_code == 200:
-            return r.json()
+            return r.json(), 200
+        return None, r.status_code
     except Exception:
-        pass
-    return None
+        return None, -1
 
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
-    """Dubinska pretraga – hvata SVE kartice iz sekcije Deals & Benefits."""
+    """
+    Cita akcije iz discounts[] arraya u dynamic endpointu.
+    Struktura (potvrdjena u Network tabu):
+      discounts[i].banner.formatted_text  -> glavni opis
+      discounts[i].effect_item_badge.text -> kratak tag ("-20%", "Deal")
+      discounts[i].condition_badge.text   -> uslovni tag
+    """
     url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
-    data = wolt_get(url)
+    data, status = wolt_get(url)
     if not data:
         return []
 
     akcije = set()
+    ignore_texts = {
+        "prikaži detalje", "show details", "vidi sve", "see all",
+        "detalji restorana", "restaurant details",
+    }
 
-    def _extract(obj):
-        if isinstance(obj, dict):
-            # Wolt glavni tekst uvek drži pod "formatted_text" ili "title"
-            text = obj.get("formatted_text") or obj.get("title")
-            
-            # Želimo sve, ali izbacujemo sistemska dugmad iz aplikacije
-            ignore_texts = ["prikaži detalje", "show details", "vidi sve", "see all", "detalji restorana"]
-            
-            if text and isinstance(text, str) and len(text) > 3:
-                if not any(ign in text.lower() for ign in ignore_texts):
-                    akcije.add(f"• {text.strip()}")
-            
-            for v in obj.values():
-                _extract(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _extract(item)
+    discounts = data.get("discounts", [])
+    for disc in discounts:
+        if not isinstance(disc, dict):
+            continue
 
-    _extract(data)
+        banner = disc.get("banner") or {}
+        main_text = (banner.get("formatted_text") or "").strip()
+
+        eff_badge = disc.get("effect_item_badge") or {}
+        badge_text = (eff_badge.get("text") or "").strip()
+
+        cond_badge = disc.get("condition_badge") or {}
+        cond_text = (cond_badge.get("text") or "").strip()
+
+        best = main_text or badge_text or cond_text
+        if not best or best.lower() in ignore_texts or len(best) <= 2:
+            continue
+
+        if main_text and badge_text and badge_text.lower() not in main_text.lower():
+            akcije.add(f"• [{badge_text}] {main_text}")
+        else:
+            akcije.add(f"• {best}")
+
+    # Fallback na stari nacin ako nema discounts kljuca
+    if not akcije:
+        def _scan(obj):
+            if isinstance(obj, dict):
+                for k in ("formatted_text", "title"):
+                    t = (obj.get(k) or "").strip()
+                    if t and t.lower() not in ignore_texts and len(t) > 3:
+                        akcije.add(f"• {t}")
+                for v in obj.values():
+                    _scan(v)
+            elif isinstance(obj, list):
+                for i in obj:
+                    _scan(i)
+        _scan(data)
+
     return list(akcije)
 
 def fetch_city(city: str, status_placeholder) -> list[dict]:
@@ -166,7 +201,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
             f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={lat}&lon={lon}&skip={skip}",
             f"https://restaurant-api.wolt.com/v1/pages/delivery?lat={lat}&lon={lon}&skip={skip}",
         ]:
-            data = wolt_get(endpoint)
+            data, _status = wolt_get(endpoint)
             if not data:
                 continue
 
@@ -803,7 +838,7 @@ with tab_debug:
         # ── 1. Feed (listing) podaci ──────────────────────────────────────
         st.markdown("#### 1️⃣ Feed – badges & label (sa listing stranice)")
         feed_url = f"https://restaurant-api.wolt.com/v3/venues/slug/{debug_slug}"
-        feed_data = wolt_get(feed_url)
+        feed_data, feed_status = wolt_get(feed_url)
         if feed_data:
             # Izvuci badges i label direktno
             results = feed_data.get("results", [{}])
@@ -815,7 +850,7 @@ with tab_debug:
             with st.expander("Pun JSON (v3/venues/slug)"):
                 st.json(feed_data)
         else:
-            st.warning("v3 endpoint nije vratio podatke.")
+            st.warning(f"v3 endpoint nije vratio podatke. HTTP status: {feed_status}")
 
         st.markdown("---")
 
@@ -825,7 +860,7 @@ with tab_debug:
             f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{debug_slug}/dynamic/"
             f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
         )
-        dyn_data = wolt_get(dyn_url)
+        dyn_data, dyn_status = wolt_get(dyn_url)
         if dyn_data:
             with st.expander("Pun JSON (dynamic)", expanded=True):
                 st.json(dyn_data)
@@ -842,7 +877,7 @@ with tab_debug:
                 items = sec.get("items", [])
                 st.markdown(f"- `{sec_name}` → {len(items)} stavki")
         else:
-            st.warning("Dynamic endpoint nije vratio podatke.")
+            st.warning(f"Dynamic endpoint nije vratio podatke. HTTP status: {dyn_status}")
 
         st.markdown("---")
 
@@ -852,12 +887,12 @@ with tab_debug:
             f"https://consumer-api.wolt.com/consumer-promotions/api/v1/venues/{debug_slug}/promotions"
             f"?lat={lat}&lon={lon}"
         )
-        promo_data = wolt_get(promo_url)
+        promo_data, promo_status = wolt_get(promo_url)
         if promo_data:
             with st.expander("Pun JSON (promotions)"):
                 st.json(promo_data)
         else:
-            st.warning("Promotions endpoint nije vratio podatke (ili ne postoji za ovaj restoran).")
+            st.warning(f"Promotions endpoint nije vratio podatke. HTTP status: {promo_status}")
 
         st.markdown("---")
 
@@ -867,12 +902,12 @@ with tab_debug:
             f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{debug_slug}/loyalty/"
             f"?lat={lat}&lon={lon}"
         )
-        loyalty_data = wolt_get(loyalty_url)
+        loyalty_data, loyalty_status = wolt_get(loyalty_url)
         if loyalty_data:
             with st.expander("Pun JSON (loyalty)"):
                 st.json(loyalty_data)
         else:
-            st.warning("Loyalty endpoint nije vratio podatke.")
+            st.warning(f"Loyalty endpoint nije vratio podatke. HTTP status: {loyalty_status}")
 
         st.markdown("---")
 
