@@ -22,7 +22,7 @@ EMAIL_PASSWORD = "sdehqzbnqefjlomo"   # Gmail App Password
 CITIES = ["Beograd", "Novi Sad", "Niš", "Kragujevac"]
 
 AMM_FILE   = Path("amm_baza.csv")
-AMM_COLS   = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
+AMM_COLS = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
 
 ALERT_FILE = Path("alert_log.csv")
 ALERT_COLS = ["timestamp", "city", "restaurant_display", "am_name", "am_email", "akcije"]
@@ -86,18 +86,21 @@ def append_alert_log(rows: list):
     else:
         df_new.to_csv(ALERT_FILE, index=False)
 
-# ─────────────────────────── WOLT API ────────────────────────────────────────
+# ─────────────────────────── WOLT API & SESSION ──────────────────────────────
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9,sr;q=0.8",
+    "Accept-Language": "sr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://wolt.com",
     "Referer": "https://wolt.com/",
 }
 
-# Hardkodirane koordinate – nema potrebe za geocodingom
+# Kreiramo perzistentnu sesiju kako bi kolačići opstali kroz zahteve
+session = requests.Session()
+session.headers.update(BROWSER_HEADERS)
+
 CITY_COORDS = {
     "Beograd":    (44.8178, 20.4569),
     "Novi Sad":   (45.2671, 19.8335),
@@ -112,101 +115,82 @@ CITY_SLUG_MAP = {
     "Kragujevac": "kragujevac",
 }
 
-
 def wolt_get(url: str) -> dict | None:
-    """Jednostavan GET sa browser headerima."""
+    """Stabilniji GET zahtev koji koristi deljenu sesiju."""
     try:
-        r = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
+        r = session.get(url, timeout=15)
         if r.status_code == 200:
             return r.json()
     except Exception:
         pass
     return None
 
-
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
     """
-    Poziva Wolt dynamic endpoint – venue-level akcije
-    (ono što se vidi u 'Deals & benefits' na stranici restorana).
+    Poziva stabilniji Wolt Venue API i izvlači informacije o popustima
+    iz tagova, opisa i marketinških tekstova.
     """
-    url = (
-        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
-        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
-    )
+    url = f"https://restaurant-api.wolt.com/v3/venues/slug/{slug}"
     data = wolt_get(url)
-    if not data:
+    
+    if not data or "results" not in data or not data["results"]:
         return "-"
 
-    seen, res = set(), []
+    venue_data = data["results"][0]
+    res = []
+    seen = set()
 
-    def _read(obj):
-        if isinstance(obj, dict):
-            for disc in obj.get("discounts", []):
-                _extract_title(disc)
-            for badge in obj.get("badges", []):
-                _extract_title(badge)
-            _extract_title(obj)
-            for v in obj.values():
-                if isinstance(v, (dict, list)):
-                    _read(v)
-        elif isinstance(obj, list):
-            for i in obj:
-                _read(i)
+    # 1. Provera kroz "tags" (npr. 'discount', 'free-delivery'...)
+    tags = venue_data.get("tags", [])
+    for tag in tags:
+        if any(keyword in tag.lower() for keyword in ["popust", "akcija", "discount", "snizeno"]):
+            msg = f"• Tag: {tag.replace('-', ' ').title()}"
+            if msg.lower() not in seen:
+                seen.add(msg.lower())
+                res.append(msg)
 
-    def _extract_title(d):
-        if not isinstance(d, dict):
-            return
-        candidates = [
-            d.get("title", ""),
-            d.get("text", ""),
-            d.get("label", ""),
-            d.get("formatted_text", ""),
-            (d.get("description") or {}).get("title", ""),
-            (d.get("banner") or {}).get("formatted_text", ""),
-            (d.get("condition_item_badge") or {}).get("text", ""),
-        ]
-        for t in candidates:
-            t = str(t or "").strip()
-            if len(t) < 3 or t.lower() in seen:
-                continue
-            if re.match(r"^\d+$", t):
-                continue
-            seen.add(t.lower())
-            display = t if len(t) <= 90 else t[:87] + "..."
-            res.append(f"• {display}")
+    # 2. Provera kroz kratki marketinški tekst/opis restorana
+    short_description = venue_data.get("short_description", "")
+    if short_description and any(keyword in short_description.lower() for keyword in ["popust", "%", "rsd", "akcija", "gratis"]):
+        msg = f"• Info: {short_description}"
+        if msg.lower() not in seen:
+            seen.add(msg.lower())
+            res.append(msg)
 
-    _read(data)
-
-    # Fallback regex
-    if not res:
-        raw = json.dumps(data)
-        for pct in re.findall(r'(\d{1,3}\s*%\s*(?:off|popust|discount))', raw, re.I):
-            k = pct.lower()
+    # 3. Fallback regex za pronalazak popusta u tekstu
+    raw = json.dumps(venue_data)
+    for pct in re.findall(r'(\d{1,3}\s*%\s*(?:off|popust|discount|sniženo))', raw, re.I):
+        k = pct.lower()
+        if k not in seen:
+            seen.add(k)
+            res.append(f"• Popust {pct.strip()}")
+            
+    for amt in re.findall(r'(\d{2,5})\s*(?:rsd|din)', raw, re.I):
+        if 50 <= int(amt) <= 2000:
+            k = f"{amt}_rsd"
             if k not in seen:
                 seen.add(k)
-                res.append(f"• {pct.strip()}")
-        for amt in re.findall(r'(\d{2,5})\s*(?:rsd|din)', raw, re.I):
-            if int(amt) > 10:
-                k = f"{amt}_rsd"
-                if k not in seen:
-                    seen.add(k)
-                    res.append(f"• {amt} RSD popust")
+                res.append(f"• Popust/Akcija {amt} RSD")
 
     return "\n".join(res) if res else "-"
 
-
 def fetch_menu_discounts(slug: str) -> str | None:
-    """Proverava meni za precrtane cene (item-level popusti)."""
-    url = f"https://restaurant-api.wolt.com/v4/venues/slug/{slug}/menu?unit_prices=true"
+    """Proverava meni za precrtane cene (item-level popusti) preko v4 endpointa."""
+    url = f"https://restaurant-api.wolt.com/v4/venues/slug/{slug}/menu"
     data = wolt_get(url)
     if not data:
         return None
 
-    discounted, max_pct = 0, 0
-    for cat in data.get("categories", []):
+    discounted = 0
+    max_pct = 0
+    
+    categories = data.get("categories", []) or data.get("results", {}).get("categories", [])
+    
+    for cat in categories:
         for item in cat.get("items", []):
-            price = item.get("baseprice") or item.get("price") or 0
-            orig  = item.get("original_price") or 0
+            price = item.get("baseprice", item.get("price", 0))
+            orig  = item.get("original_price", 0)
+            
             if orig > 0 and orig > price > 0:
                 discounted += 1
                 pct = round((1 - price / orig) * 100)
@@ -214,13 +198,11 @@ def fetch_menu_discounts(slug: str) -> str | None:
                     max_pct = pct
 
     if discounted > 0:
-        return f"• Popust do {max_pct}% na {discounted} artikala u meniju"
+        return f"• Sniženo do {max_pct}% na {discounted} artikala u meniju"
     return None
 
-
 def fetch_city(city: str, status_placeholder) -> list[dict]:
-    """Skenira jedan grad: feed API za listu + dynamic endpoint za akcije."""
-
+    """Skenira jedan grad: feed API za listu + dynamic/menu endpoint za akcije."""
     city_slug = CITY_SLUG_MAP.get(city, normalize(city).replace(" ", "-"))
     lat, lon  = CITY_COORDS.get(city, (44.8178, 20.4569))
 
@@ -269,7 +251,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                     items_found += 1
 
             if items_found > 0:
-                break  # uspešan endpoint
+                break
 
         status_placeholder.info(
             f"🚴 **{city}**: {len(restaurants)} restorana (stranica {page_num + 1})"
@@ -283,7 +265,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
         status_placeholder.warning(f"⚠️ **{city}**: nije pronađen nijedan restoran.")
         return []
 
-    # ── Korak 2: Konkurentno učitavamo akcije ────────────────────────────────
+    # ── Korak 2: Konkurentno učitavanje akcija (Smanjen broj workers zbog zaštite) ──
     slugs = list(restaurants.keys())
     total = len(slugs)
     status_placeholder.info(f"🎯 **{city}**: učitavam akcije za {total} restorana...")
@@ -296,18 +278,17 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
         return slug, "\n".join(parts) if parts else "-"
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=15) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_fetch_one, slug): slug for slug in slugs}
         for fut in as_completed(futures):
             slug, akcije = fut.result()
             restaurants[slug]["akcije"] = akcije
             completed += 1
-            if completed % 10 == 0 or completed == total:
+            if completed % 5 == 0 or completed == total:
                 progress.progress(completed / total, text=f"{completed} / {total}")
 
     progress.empty()
     return list(restaurants.values())
-
 
 def scan_all_cities(selected_cities: list[str], status_placeholder) -> pd.DataFrame:
     all_rows = []
@@ -320,24 +301,9 @@ def scan_all_cities(selected_cities: list[str], status_placeholder) -> pd.DataFr
     status_placeholder.empty()
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
-
-def scan_all_cities(progress_placeholder) -> pd.DataFrame:
-    all_rows = []
-    for i, city in enumerate(CITIES):
-        rows = fetch_city(city, progress_placeholder)
-        all_rows.extend(rows)
-        progress_placeholder.info(f"✅ {city}: {len(rows)} restorana | Ukupno: {len(all_rows)}")
-        if i < len(CITIES) - 1:
-            time.sleep(1)
-    progress_placeholder.empty()
-    return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
-
 # ─────────────────────────── EMAIL ───────────────────────────────────────────
 
 def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
-    """
-    alerts = lista: {naziv, grad, akcije}
-    """
     try:
         rows_html = ""
         for a in alerts:
@@ -414,7 +380,6 @@ tab_scan, tab_amm, tab_alert, tab_stats = st.tabs([
 with tab_scan:
     st.markdown("### 🔍 Wolt scan")
 
-    # ── Izbor gradova ─────────────────────────────────────────────────────────
     selected_cities = st.multiselect(
         "📍 Gradovi za skeniranje:",
         options=CITIES,
@@ -431,7 +396,7 @@ with tab_scan:
         )
     with col_info:
         if st.session_state.last_scan:
-            st.info(f"⏱️ Poslednji scan: **{st.session_state.last_scan}**  |  "
+            st.info(f"⏱️ Poslednji scan: **{st.session_state.last_scan}** |  "
                     f"Ukupno restorana: **{len(st.session_state.df_wolt)}**")
         if not selected_cities:
             st.warning("Izaberi bar jedan grad.")
@@ -448,17 +413,10 @@ with tab_scan:
         else:
             st.error("❌ Scan nije vratio podatke. Proveri internet konekciju.")
 
-            st.session_state.df_wolt = df
-            st.session_state.last_scan = local_now()
-            st.success(f"✅ Scan završen! Pronađeno **{len(df)}** restorana.")
-        else:
-            st.error("❌ Scan nije vratio podatke. Proveri internet konekciju.")
-
     df = st.session_state.df_wolt
     if not df.empty:
         st.markdown("---")
 
-        # KPI red
         k1, k2, k3, k4 = st.columns(4)
         total = len(df)
         sa_akcijama = len(df[df["akcije"] != "-"])
@@ -480,7 +438,6 @@ with tab_scan:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Filteri
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             grad_filter = st.multiselect("Grad:", CITIES, default=CITIES, key="scan_grad")
@@ -514,10 +471,8 @@ with tab_scan:
             },
         )
 
-        # Eksport
         csv = fdf[display_cols].to_csv(index=False).encode("utf-8")
         st.download_button("📥 Preuzmi CSV", csv, "wolt_scan.csv", "text/csv")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: AMM BAZA
@@ -529,7 +484,6 @@ with tab_amm:
     amm_df = load_amm()
     df_wolt = st.session_state.df_wolt
 
-    # ── Dodavanje ─────────────────────────────────────────────────────────────
     st.markdown("#### ➕ Dodaj / ažuriraj")
 
     rest_options = sorted(df_wolt["naziv"].dropna().unique().tolist()) if not df_wolt.empty else []
@@ -584,7 +538,6 @@ with tab_amm:
 
     st.markdown("---")
 
-    # ── Prikaz i editovanje ───────────────────────────────────────────────────
     st.markdown("#### 📋 Trenutna baza")
 
     if amm_df.empty:
@@ -617,15 +570,12 @@ with tab_amm:
             st.success("✅ Baza ažurirana!")
             st.rerun()
 
-    # ── Export restorana za bulk popunjavanje ────────────────────────────────
     st.markdown("---")
     st.markdown("#### 📤 Export restorana za dodelu AM-ova")
-    st.caption("Preuzmi CSV sa svim restoranima iz poslednjeg scana, popuni kolone `am_name` i `am_email` u Excelu, pa uvezi nazad.")
-
+    
     if df_wolt.empty:
         st.info("Pokreni scan prvo pa će se ovde pojaviti lista restorana.")
     else:
-        # Pravljenje export CSV-a sa praznim AM kolonama
         export_df = df_wolt[["grad", "naziv"]].copy()
         export_df["restaurant_display"] = export_df["naziv"]
         export_df["city"] = export_df["grad"]
@@ -646,13 +596,10 @@ with tab_amm:
             csv_out,
             "restorani_za_amm.csv",
             "text/csv",
-            help="Otvori u Excelu, popuni am_name i am_email, pa uvezi nazad dole."
         )
 
-    # ── Bulk CSV import ───────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### 📥 Bulk import CSV")
-    st.caption("Kolone: `restaurant_display, city, am_name, am_email`")
     uploaded = st.file_uploader("CSV fajl:", type="csv", key="amm_upload")
     if uploaded:
         try:
@@ -666,7 +613,6 @@ with tab_amm:
             st.rerun()
         except Exception as e:
             st.error(f"Greška: {e}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3: POŠALJI ALERT
@@ -682,25 +628,21 @@ with tab_alert:
     elif amm_df.empty:
         st.warning("⚠️ AMM baza je prazna. Dodaj restorane u drugom tabu.")
     else:
-        # ── Preview: koji partneri imaju akcije ──────────────────────────────
         st.markdown("#### 🔍 Pregled – partneri sa akcijama")
 
         df_wolt["naziv_norm"] = df_wolt["naziv"].apply(normalize)
         amm_df["restaurant_norm"] = amm_df["restaurant_norm"].apply(str)
 
-        # Spoji scan sa AMM bazom
         merged = df_wolt.merge(
             amm_df[["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]],
             left_on="naziv_norm", right_on="restaurant_norm", how="inner"
         )
 
-        # Filtriramo samo one koji imaju akcije
         sa_akcijama = merged[merged["akcije"] != "-"].copy()
 
         if sa_akcijama.empty:
             st.info("✅ Nijedan partner iz AMM baze trenutno nema aktivne akcije na Wolt-u.")
         else:
-            # Filtri
             af1, af2 = st.columns(2)
             with af1:
                 grad_filt_a = st.multiselect("Grad:", CITIES, default=CITIES, key="alert_grad")
@@ -735,15 +677,12 @@ with tab_alert:
 
             st.markdown("---")
 
-            # ── Slanje maila ─────────────────────────────────────────────────
             st.markdown("#### 📤 Pošalji mailove")
             st.info("Svaki AM dobija jedan mail sa svim svojim partnerima koji imaju akcije.")
 
-            if st.button("🚀 Pošalji alertove", type="primary", use_container_width=False):
-                # Grupiši po AM-u
+            if st.button("🚀 Pošalji alertove", type="primary"):
                 am_groups = preview.groupby(["am_name", "am_email"])
                 sent_log = []
-                results_col = st.empty()
                 success_count = 0
 
                 for (am_name, am_email), grp in am_groups:
@@ -772,7 +711,6 @@ with tab_alert:
 
                 st.markdown(f"**Završeno:** {success_count}/{am_groups.ngroups} mailova poslato.")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4: STATISTIKA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -786,7 +724,6 @@ with tab_stats:
     else:
         log["timestamp"] = pd.to_datetime(log["timestamp"], errors="coerce")
 
-        # Date filter
         min_d = log["timestamp"].min().date()
         max_d = log["timestamp"].max().date()
         s1, s2 = st.columns(2)
@@ -801,7 +738,6 @@ with tab_stats:
         if flog.empty:
             st.warning("Nema podataka za izabrani period.")
         else:
-            # KPI
             k1, k2, k3, k4 = st.columns(4)
             for col, val, lbl, color in [
                 (k1, len(flog),                           "Ukupno alerta",      "#009de0"),
@@ -818,7 +754,6 @@ with tab_stats:
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # Tabela po AM-u
             st.markdown("#### 👤 Pregled po AM-u")
             am_stats = (
                 flog.groupby(["am_name", "am_email"])
@@ -837,7 +772,6 @@ with tab_stats:
 
             st.markdown("---")
 
-            # Detaljan log
             st.markdown("#### 🗂️ Detaljan log")
             am_log_sel = st.selectbox(
                 "Filtriraj po AM-u:",
