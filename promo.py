@@ -27,7 +27,7 @@ ALERT_COLS = ["timestamp", "city", "restaurant_display", "am_name", "am_email", 
 
 # ─────────────────────────── PAGE CONFIG ─────────────────────────────────────
 
-st.set_page_config(page_title="Wolt Monitor", page_icon="🚴", layout="wide")
+st.set_page_config(page_title="Promo Monitor", page_icon="🚴", layout="wide")
 
 st.markdown("""
 <style>
@@ -184,6 +184,16 @@ def extract_discounts(item: dict) -> str:
 
 def fetch_city(city: str, status_placeholder) -> list[dict]:
     """Skenira jedan grad i vraća listu restorana sa akcijama."""
+
+    # Mapa grad → Wolt URL slug (onako kako Wolt koristi u linkovima)
+    CITY_SLUG_MAP = {
+        "Beograd":    "belgrade",
+        "Novi Sad":   "novi-sad",
+        "Niš":        "nis",
+        "Kragujevac": "kragujevac",
+    }
+    city_slug = CITY_SLUG_MAP.get(city, normalize(city).replace(" ", "-"))
+
     status_placeholder.info(f"📍 Geocodiram **{city}**...")
     coords = geocode(city)
     if not coords:
@@ -235,7 +245,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                         "ocena":          str(rating_score),
                         "dostava":        delivery_time,
                         "akcije":         akcije,
-                        "link":           f"https://wolt.com/sr/srb/restaurant/{slug}",
+                        "link":           f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm":     normalize(name),
                     }
                     items_found += 1
@@ -332,7 +342,7 @@ if "last_scan" not in st.session_state:
 
 # ─────────────────────────── UI ──────────────────────────────────────────────
 
-st.title("🚴 Wolt Monitor")
+st.title("🚴 Promo Monitor")
 st.caption("Prati akcije Wolt partnera po gradovima i obaveštava Account Managere.")
 
 tab_scan, tab_amm, tab_alert, tab_stats = st.tabs([
@@ -530,6 +540,38 @@ with tab_amm:
                 save_amm(pd.concat([rest_df, edited], ignore_index=True))
             st.success("✅ Baza ažurirana!")
             st.rerun()
+
+    # ── Export restorana za bulk popunjavanje ────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📤 Export restorana za dodelu AM-ova")
+    st.caption("Preuzmi CSV sa svim restoranima iz poslednjeg scana, popuni kolone `am_name` i `am_email` u Excelu, pa uvezi nazad.")
+
+    if df_wolt.empty:
+        st.info("Pokreni scan prvo pa će se ovde pojaviti lista restorana.")
+    else:
+        # Pravljenje export CSV-a sa praznim AM kolonama
+        export_df = df_wolt[["grad", "naziv"]].copy()
+        export_df["restaurant_display"] = export_df["naziv"]
+        export_df["city"] = export_df["grad"]
+        export_df["am_name"] = ""
+        export_df["am_email"] = ""
+        export_df = export_df[["restaurant_display", "city", "am_name", "am_email"]].drop_duplicates()
+
+        grad_exp = st.multiselect(
+            "Filtriraj po gradu (za export):",
+            CITIES, default=CITIES, key="amm_export_grad"
+        )
+        export_filtered = export_df[export_df["city"].isin(grad_exp)]
+        st.caption(f"Restorana za export: **{len(export_filtered)}**")
+
+        csv_out = export_filtered.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Preuzmi listu restorana (CSV)",
+            csv_out,
+            "restorani_za_amm.csv",
+            "text/csv",
+            help="Otvori u Excelu, popuni am_name i am_email, pa uvezi nazad dole."
+        )
 
     # ── Bulk CSV import ───────────────────────────────────────────────────────
     st.markdown("---")
