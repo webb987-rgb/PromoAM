@@ -289,20 +289,22 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
     progress_text = f"🎯 Učitavam detaljne akcije za {city}..."
     progress_bar = st.progress(0, text=progress_text)
     
+    # Sekvencijalno sa pauzom - Wolt rate-limituje ako šaljemo previše simultanih zahteva
     completed = 0
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(fetch_dynamic_discounts, slug, lat, lon): slug for slug in slugs}
-        for fut in as_completed(futures):
-            slug = futures[fut]
-            dynamic_akcije = fut.result()
-            
-            # Spajamo feed bedževe i detaljne akcije (uklanjamo duplikate)
-            sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
-            restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
-            
-            completed += 1
-            if completed % 5 == 0 or completed == total:
-                progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
+    for slug in slugs:
+        try:
+            dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
+        except Exception:
+            dynamic_akcije = []
+
+        sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
+        restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
+
+        completed += 1
+        if completed % 5 == 0 or completed == total:
+            progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
+        
+        time.sleep(0.5)  # pauza da ne triggerjemo rate-limit
 
     progress_bar.empty()
     
