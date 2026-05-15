@@ -352,11 +352,12 @@ if "last_scan" not in st.session_state:
 st.title("🚴 Promo Monitor")
 st.caption("Prati akcije Wolt partnera po gradovima i obaveštava Account Managere.")
 
-tab_scan, tab_amm, tab_alert, tab_stats = st.tabs([
+tab_scan, tab_amm, tab_alert, tab_stats, tab_debug = st.tabs([
     "🔍 Scan & Rezultati",
     "👥 AMM Baza",
     "📧 Pošalji Alert",
     "📈 Statistika",
+    "🔧 Debug API",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -776,3 +777,110 @@ with tab_stats:
 
             csv_exp = log_view.to_csv(index=False).encode("utf-8")
             st.download_button("📥 Eksportuj log", csv_exp, "alert_log.csv", "text/csv")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5: DEBUG API
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_debug:
+    st.markdown("### 🔧 Debug – Sirovi API odgovor za restoran")
+    st.info(
+        "Unesi slug restorana (deo URL-a: `wolt.com/en/srb/nis/restaurant/**SLUG**`) "
+        "i izaberi grad da vidimo šta API tačno vraća."
+    )
+
+    dc1, dc2 = st.columns([2, 1])
+    with dc1:
+        debug_slug = st.text_input("Slug restorana:", placeholder="npr. mcdonalds-nis", key="debug_slug")
+    with dc2:
+        debug_city = st.selectbox("Grad:", CITIES, key="debug_city")
+
+    if st.button("🔍 Dohvati sirovi JSON", key="debug_fetch") and debug_slug:
+        lat, lon = CITY_COORDS.get(debug_city, (44.8178, 20.4569))
+        city_slug = CITY_SLUG_MAP.get(debug_city, "nis")
+
+        st.markdown("---")
+
+        # ── 1. Feed (listing) podaci ──────────────────────────────────────
+        st.markdown("#### 1️⃣ Feed – badges & label (sa listing stranice)")
+        feed_url = f"https://restaurant-api.wolt.com/v3/venues/slug/{debug_slug}"
+        feed_data = wolt_get(feed_url)
+        if feed_data:
+            # Izvuci badges i label direktno
+            results = feed_data.get("results", [{}])
+            venue_info = results[0] if results else {}
+            badges = venue_info.get("badges", [])
+            label  = venue_info.get("label", "")
+            st.write(f"**badges:** {badges}")
+            st.write(f"**label:** `{label}`")
+            with st.expander("Pun JSON (v3/venues/slug)"):
+                st.json(feed_data)
+        else:
+            st.warning("v3 endpoint nije vratio podatke.")
+
+        st.markdown("---")
+
+        # ── 2. Dynamic / Deals & Benefits ────────────────────────────────
+        st.markdown("#### 2️⃣ Dynamic endpoint (Deals & Benefits)")
+        dyn_url = (
+            f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{debug_slug}/dynamic/"
+            f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
+        )
+        dyn_data = wolt_get(dyn_url)
+        if dyn_data:
+            with st.expander("Pun JSON (dynamic)", expanded=True):
+                st.json(dyn_data)
+
+            # Pokazi sve kljuceve prvog nivoa
+            st.markdown("**Ključevi na vrhu odgovora:**")
+            st.write(list(dyn_data.keys()))
+
+            # Traži sekcije koje sadrže promocije
+            sections = dyn_data.get("sections", [])
+            st.markdown(f"**Broj sekcija:** {len(sections)}")
+            for i, sec in enumerate(sections):
+                sec_name = sec.get("name") or sec.get("title") or sec.get("template") or f"sekcija_{i}"
+                items = sec.get("items", [])
+                st.markdown(f"- `{sec_name}` → {len(items)} stavki")
+        else:
+            st.warning("Dynamic endpoint nije vratio podatke.")
+
+        st.markdown("---")
+
+        # ── 3. Promotions dedicated endpoint ─────────────────────────────
+        st.markdown("#### 3️⃣ Promotions endpoint")
+        promo_url = (
+            f"https://consumer-api.wolt.com/consumer-promotions/api/v1/venues/{debug_slug}/promotions"
+            f"?lat={lat}&lon={lon}"
+        )
+        promo_data = wolt_get(promo_url)
+        if promo_data:
+            with st.expander("Pun JSON (promotions)"):
+                st.json(promo_data)
+        else:
+            st.warning("Promotions endpoint nije vratio podatke (ili ne postoji za ovaj restoran).")
+
+        st.markdown("---")
+
+        # ── 4. Loyalty / deals sekcija ───────────────────────────────────
+        st.markdown("#### 4️⃣ Loyalty/Deals endpoint")
+        loyalty_url = (
+            f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{debug_slug}/loyalty/"
+            f"?lat={lat}&lon={lon}"
+        )
+        loyalty_data = wolt_get(loyalty_url)
+        if loyalty_data:
+            with st.expander("Pun JSON (loyalty)"):
+                st.json(loyalty_data)
+        else:
+            st.warning("Loyalty endpoint nije vratio podatke.")
+
+        st.markdown("---")
+
+        # ── 5. Šta trenutna skripta pronalazi ────────────────────────────
+        st.markdown("#### 5️⃣ Šta trenutna skripta pronalazi za ovaj restoran")
+        found = fetch_dynamic_discounts(debug_slug, lat, lon)
+        if found:
+            for f_item in found:
+                st.write(f_item)
+        else:
+            st.error("Skripta nije pronašla nijednu akciju.")
