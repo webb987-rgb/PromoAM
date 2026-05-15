@@ -81,12 +81,16 @@ def append_alert_log(rows: list):
 
 # ─────────────────────────── WOLT API & SESSION ──────────────────────────────
 
+# ⚠️  COOKIE – osvežavaj kad akcije prestanu da se čitaju (traje ~24h)
+# Kako: wolt.com → F12 → Network → klikni dynamic?lat= → Request Headers → kopiraj Cookie
+WOLT_COOKIE = ""  # <-- UNESI COOKIE OVDE
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "sr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://wolt.com",
-    "Referer": "https://wolt.com/",
+    "Referer": "https://wolt.com/en/srb/",
     "W-PlatformType": "Web",
     "W-Wolt-Session-Id": "wolt-monitor-session",
 }
@@ -94,6 +98,8 @@ BROWSER_HEADERS = {
 # Perzistentna sesija da izbegnemo blokade
 session = requests.Session()
 session.headers.update(BROWSER_HEADERS)
+if WOLT_COOKIE:
+    session.headers["Cookie"] = WOLT_COOKIE
 
 CITY_COORDS = {
     "Beograd":    (44.8178, 20.4569),
@@ -423,6 +429,13 @@ with tab_scan:
             st.warning("Izaberi bar jedan grad.")
 
     if run_scan and selected_cities:
+        # Primeni cookie ako je sačuvan
+        cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
+        if cookie:
+            session.headers["Cookie"] = cookie
+        elif "Cookie" in session.headers:
+            del session.headers["Cookie"]
+
         ph = st.empty()
         with st.spinner("Skeniranje u toku (ovo može potrajati minut-dva zbog detaljnih akcija)..."):
             df = scan_all_cities(selected_cities, ph)
@@ -817,6 +830,34 @@ with tab_stats:
 # TAB 5: DEBUG API
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_debug:
+    st.markdown("### 🔧 Debug & Podešavanja")
+
+    st.markdown("#### 🍪 Wolt Cookie")
+    st.markdown("""
+Cookie je potreban da bi `consumer-api.wolt.com` vraćao akcije restorana.  
+**Kako ga nabaviti:** Otvori bilo koji restoran na wolt.com → F12 → Network tab → 
+klikni na `dynamic?lat=` request → Request Headers → kopiraj celu vrednost `Cookie:` polja.  
+Cookie traje ~24h, posle toga ga osvežiti.
+    """)
+
+    saved_cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
+    new_cookie = st.text_area(
+        "Cookie string:",
+        value=saved_cookie,
+        height=100,
+        placeholder="ravelinDeviceId=...; __woltUid=...; ...",
+        key="cookie_input"
+    )
+    if st.button("💾 Sačuvaj cookie i primeni", key="save_cookie"):
+        st.session_state["wolt_cookie"] = new_cookie
+        session.headers["Cookie"] = new_cookie
+        st.success("✅ Cookie sačuvan i primenjen za ovaj session.")
+
+    # Uvek primeni cookie iz session_state na pocetku
+    if "wolt_cookie" in st.session_state and st.session_state["wolt_cookie"]:
+        session.headers["Cookie"] = st.session_state["wolt_cookie"]
+
+    st.markdown("---")
     st.markdown("### 🔧 Debug – Sirovi API odgovor za restoran")
     st.info(
         "Unesi slug restorana (deo URL-a: `wolt.com/en/srb/nis/restaurant/**SLUG**`) "
