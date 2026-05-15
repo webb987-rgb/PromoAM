@@ -7,6 +7,17 @@ import pandas as pd
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from playwright.async_api import async_playwright
+import os
+import subprocess
+
+# Instalacija browsera ako nisu prisutni (bitno za Streamlit Cloud)
+try:
+    import playwright
+except ImportError:
+    os.system("pip install playwright")
+
+# Komanda koja instalira Chromium browser
+subprocess.run(["playwright", "install", "chromium"])
 
 # ================= KONFIGURACIJA =================
 EMAIL_SENDER = "webb987@gmail.com"
