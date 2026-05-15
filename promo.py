@@ -131,16 +131,24 @@ def wolt_get(url: str, extra_headers: dict = None) -> tuple:
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
     """
     Cita akcije iz dynamic endpointa.
-    Potvrdjene strukture iz Network taba:
-      sections[i].items[j].discount.formatted_text  -> "400 RSD off on orders over 1,000 RSD"
-      sections[i].items[j].applied_subtitle         -> "-20% discount on selected items..."
-      sections[i].items[j].discount.discount_id     -> identifikator kampanje
+    Struktura: venue_raw.discounts[i].banner.formatted_text
     """
     url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
-    data, status = wolt_get(url)
+    # Pravimo novi session po threadu da izbegnemo thread-safety probleme
+    # ali kopiramo sve headere ukljucujuci cookie iz globalnog sessiona
+    thread_session = requests.Session()
+    thread_session.headers.update(dict(session.headers))
+    
+    try:
+        r = thread_session.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+    except Exception:
+        return []
     if not data:
         return []
 
@@ -148,7 +156,7 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
     ignore_texts = {
         "prikaži detalje", "show details", "vidi sve", "see all",
         "detalji restorana", "restaurant details", "more", "još",
-        "schedule order", "naruči", "see menu",
+        "schedule order", "naruči", "see menu", "add {amount} more",
     }
 
     def add(text):
@@ -156,51 +164,25 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
         if t and len(t) > 3 and t.lower() not in ignore_texts:
             akcije.add(f"• {t}")
 
-    # Prolazi kroz sections -> items
-    for section in data.get("sections", []):
-        if not isinstance(section, dict):
+    # Potvrdjeni putevi iz JSON-a (venue_raw.discounts[]):
+    #   .banner.formatted_text  -> glavni tekst
+    #   .description.title      -> alternativni tekst
+    venue_raw = data.get("venue_raw") or {}
+    for disc in venue_raw.get("discounts", []):
+        if not isinstance(disc, dict):
             continue
-        for item in section.get("items", []):
-            if not isinstance(item, dict):
-                continue
+        banner = disc.get("banner") or {}
+        add(banner.get("formatted_text"))
+        desc = disc.get("description") or {}
+        add(desc.get("title"))
 
-            # 1. discount.formatted_text  (npr. "400 RSD off on orders over 1,000 RSD")
-            discount = item.get("discount") or {}
-            add(discount.get("formatted_text"))
-
-            # 2. applied_subtitle  (npr. "-20% discount on selected items will be deducted at the checkout")
-            add(item.get("applied_subtitle"))
-
-            # 3. title / description na samom itemu
-            add(item.get("title"))
-            add(item.get("description"))
-
-            # 4. badge tekstovi
-            for badge_key in ("badge", "label_badge", "item_badge"):
-                badge = item.get(badge_key) or {}
-                if isinstance(badge, dict):
-                    add(badge.get("text"))
-                elif isinstance(badge, str):
-                    add(badge)
-
-    # Fallback: stari rekurzivni scan ako sections nista nije dao
-    if not akcije:
-        seen = set()
-        def _scan(obj, depth=0):
-            if depth > 8:
-                return
-            if isinstance(obj, dict):
-                for k in ("formatted_text", "applied_subtitle", "title"):
-                    t = (obj.get(k) or "").strip()
-                    if t and len(t) > 4 and t.lower() not in ignore_texts and t not in seen:
-                        seen.add(t)
-                        akcije.add(f"• {t}")
-                for v in obj.values():
-                    _scan(v, depth + 1)
-            elif isinstance(obj, list):
-                for i in obj:
-                    _scan(i, depth + 1)
-        _scan(data)
+    # Takodje provjeri venue.banners[] za isti tekst
+    venue = data.get("venue") or {}
+    for banner in venue.get("banners", []):
+        if not isinstance(banner, dict):
+            continue
+        disc = banner.get("discount") or {}
+        add(disc.get("formatted_text"))
 
     return list(akcije)
 
