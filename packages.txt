@@ -13,3 +13,4 @@ libcups2
 libpangocairo-1.0-0
 libasound2
 libpango-1.0-0
+schedule
