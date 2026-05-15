@@ -5,7 +5,9 @@ import datetime
 import smtplib
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 import pandas as pd
 import streamlit as st
 from email.mime.multipart import MIMEMultipart
@@ -86,12 +88,37 @@ def append_alert_log(rows: list):
 
 # ─────────────────────────── WOLT API ────────────────────────────────────────
 
-HEADERS = {
+BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "sr,en;q=0.9",
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9,sr;q=0.8",
+    "Origin": "https://wolt.com",
+    "Referer": "https://wolt.com/",
 }
+
+# ─── Wolt session (jednom inicijalizovana, drži guest cookies) ────────────────
+@st.cache_resource(show_spinner=False)
+def get_wolt_session() -> requests.Session:
+    """
+    Kreira requests.Session koja posećuje wolt.com da dobije guest cookies,
+    a onda može da poziva consumer-api endpointe koji zahtevaju autentikaciju.
+    """
+    s = requests.Session()
+    s.headers.update(BROWSER_HEADERS)
+    try:
+        # 1. Poseti homepage da dobiješ session + guest token
+        s.get("https://wolt.com/en/srb", timeout=15, allow_redirects=True)
+        time.sleep(0.5)
+        # 2. Poseti API jednom da aktiviraš guest sesiju
+        s.get(
+            "https://restaurant-api.wolt.com/v1/pages/restaurants?lat=44.817&lon=20.456&skip=0",
+            timeout=15,
+        )
+    except Exception:
+        pass
+    return s
+
 
 def geocode(city: str) -> tuple[float, float] | None:
     """Nominatim geocoding – vraća (lat, lon) ili None."""
@@ -100,9 +127,10 @@ def geocode(city: str) -> tuple[float, float] | None:
         f"?q={urllib.parse.quote(city + ', Serbia')}&format=json&limit=1"
     )
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "WoltMonitor/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
+        s = get_wolt_session()
+        r = s.get(url, headers={"User-Agent": "PromoMonitor/1.0 (contact@example.com)"},
+                  timeout=10)
+        data = r.json()
         if data:
             return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
@@ -110,82 +138,121 @@ def geocode(city: str) -> tuple[float, float] | None:
     return None
 
 
-def wolt_fetch(url: str) -> dict | None:
+def wolt_get(url: str) -> dict | None:
+    """GET kroz autentifikovanu sesiju."""
     try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read())
+        s = get_wolt_session()
+        r = s.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.json()
     except Exception:
-        return None
+        pass
+    return None
 
 
-def extract_discounts(item: dict) -> str:
-    """Izvlači sve akcije iz jednog venue stavke iz Wolt feed API odgovora."""
+def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> str:
+    """
+    Poziva Wolt dynamic endpoint koji vraća venue-level akcije
+    (isto što se vidi u 'Deals & benefits' na stranici restorana).
+    Koristi autentifikovanu sesiju sa guest cookijima.
+    """
+    url = (
+        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
+        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
+    )
+    data = wolt_get(url)
+    if not data:
+        return "-"
+
     seen, res = set(), []
 
-    def _scan(obj):
+    def _read(obj):
         if isinstance(obj, dict):
-            # Wolt discount blokovi
-            for key in ("discounts", "badges", "label"):
-                val = obj.get(key)
-                if isinstance(val, list):
-                    for d in val:
-                        _read_discount(d)
-                elif isinstance(val, dict):
-                    _read_discount(val)
+            # Direktno čitamo discount blokove
+            for disc in obj.get("discounts", []):
+                _extract_title(disc)
+            for badge in obj.get("badges", []):
+                _extract_title(badge)
+            _extract_title(obj)
             for v in obj.values():
                 if isinstance(v, (dict, list)):
-                    _scan(v)
+                    _read(v)
         elif isinstance(obj, list):
             for i in obj:
-                _scan(i)
+                _read(i)
 
-    def _read_discount(d):
+    def _extract_title(d):
         if not isinstance(d, dict):
             return
-        # traži title na svim poznatim mestima
         candidates = [
             d.get("title", ""),
+            d.get("text", ""),
+            d.get("label", ""),
+            d.get("formatted_text", ""),
             (d.get("description") or {}).get("title", ""),
             (d.get("banner") or {}).get("formatted_text", ""),
             (d.get("condition_item_badge") or {}).get("text", ""),
-            d.get("text", ""),
-            d.get("label", ""),
         ]
         for t in candidates:
             t = str(t or "").strip()
-            if len(t) < 2:
+            if len(t) < 3 or t.lower() in seen:
                 continue
-            key = t.lower()
-            if key in seen:
+            # Preskoči čisto numeričke vrednosti i interne Wolt+ kampanje
+            if re.match(r"^\d+$", t):
                 continue
-            seen.add(key)
-            display = t if len(t) <= 80 else t[:77] + "..."
+            seen.add(t.lower())
+            display = t if len(t) <= 90 else t[:87] + "..."
             res.append(f"• {display}")
 
-    _scan(item)
+    _read(data)
 
-    # Fallback: regex na JSON dump-u
-    raw = json.dumps(item)
-    for pct in re.findall(r'(\d{1,3}\s*%\s*(?:off|popust|discount))', raw, re.I):
-        k = pct.lower()
-        if k not in seen:
-            seen.add(k)
-            res.append(f"• {pct.strip()}")
-    for amt in re.findall(r'(\d{2,5})\s*(?:rsd|din)', raw, re.I):
-        if int(amt) > 10:
-            k = f"{amt} rsd"
+    # Fallback regex za % i RSD popuste ako API nije vratio strukturirane podatke
+    if not res:
+        raw = json.dumps(data)
+        for pct in re.findall(r'(\d{1,3}\s*%\s*(?:off|popust|discount))', raw, re.I):
+            k = pct.lower()
             if k not in seen:
                 seen.add(k)
-                res.append(f"• {amt} RSD popust")
+                res.append(f"• {pct.strip()}")
+        for amt in re.findall(r'(\d{2,5})\s*(?:rsd|din)', raw, re.I):
+            if int(amt) > 10:
+                k = f"{amt}_rsd"
+                if k not in seen:
+                    seen.add(k)
+                    res.append(f"• {amt} RSD popust")
 
     return "\n".join(res) if res else "-"
 
 
-def fetch_city(city: str, status_placeholder) -> list[dict]:
-    """Skenira jedan grad i vraća listu restorana sa akcijama."""
+def fetch_menu_discounts(slug: str) -> str | None:
+    """
+    Proverava meni restorana za item-level popuste (precrtane cene).
+    Vraća opis ako postoje, None ako nema.
+    """
+    url = f"https://restaurant-api.wolt.com/v4/venues/slug/{slug}/menu?unit_prices=true"
+    data = wolt_get(url)
+    if not data:
+        return None
 
-    # Mapa grad → Wolt URL slug (onako kako Wolt koristi u linkovima)
+    discounted, max_pct = 0, 0
+    for cat in data.get("categories", []):
+        for item in cat.get("items", []):
+            price = item.get("baseprice") or item.get("price") or 0
+            orig  = item.get("original_price") or 0
+            if orig > 0 and orig > price > 0:
+                discounted += 1
+                pct = round((1 - price / orig) * 100)
+                if pct > max_pct:
+                    max_pct = pct
+
+    if discounted > 0:
+        return f"• Popust do {max_pct}% na {discounted} artikala u meniju"
+    return None
+
+
+def fetch_city(city: str, status_placeholder) -> list[dict]:
+    """Skenira jedan grad: feed API za listu + dynamic endpoint za akcije."""
+
     CITY_SLUG_MAP = {
         "Beograd":    "belgrade",
         "Novi Sad":   "novi-sad",
@@ -203,21 +270,20 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
     lat, lon = coords
     restaurants = {}
     skip = 0
-    page_size = 40
     max_pages = 30
 
-    status_placeholder.info(f"🔍 Učitavam restorane za **{city}**...")
+    status_placeholder.info(f"🔍 Učitavam listu restorana za **{city}**...")
 
     for page_num in range(max_pages):
+        items_found = 0
         for endpoint in [
             f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={lat}&lon={lon}&skip={skip}",
             f"https://restaurant-api.wolt.com/v1/pages/delivery?lat={lat}&lon={lon}&skip={skip}",
         ]:
-            data = wolt_fetch(endpoint)
+            data = wolt_get(endpoint)
             if not data:
                 continue
 
-            items_found = 0
             for section in data.get("sections", []):
                 for item in section.get("items", []):
                     venue = item.get("venue")
@@ -229,39 +295,61 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                         continue
 
                     status = "Otvoren" if venue.get("online") else "Zatvoren"
-                    rating = venue.get("rating", {}) or {}
+                    rating = venue.get("rating") or {}
                     rating_score = rating.get("score", "-") if isinstance(rating, dict) else "-"
-
                     est = venue.get("estimate_range") or venue.get("estimate")
                     delivery_time = f"{est} min" if est else "-"
 
-                    akcije = extract_discounts(item)
-
                     restaurants[slug] = {
-                        "grad":           city,
-                        "naziv":          name,
-                        "slug":           slug,
-                        "status":         status,
-                        "ocena":          str(rating_score),
-                        "dostava":        delivery_time,
-                        "akcije":         akcije,
-                        "link":           f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
-                        "naziv_norm":     normalize(name),
+                        "grad":       city,
+                        "naziv":      name,
+                        "slug":       slug,
+                        "status":     status,
+                        "ocena":      str(rating_score),
+                        "dostava":    delivery_time,
+                        "akcije":     "-",
+                        "link":       f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
+                        "naziv_norm": normalize(name),
                     }
                     items_found += 1
 
             if items_found > 0:
-                break  # uspešan endpoint, ne probaj drugi
+                break
 
-        count = len(restaurants)
-        status_placeholder.info(f"🚴 **{city}**: {count} restorana učitano (stranica {page_num + 1})")
-
+        status_placeholder.info(
+            f"🚴 **{city}**: {len(restaurants)} restorana učitano (stranica {page_num + 1})"
+        )
         if items_found < 10:
-            break  # poslednja stranica
-
-        skip += page_size
+            break
+        skip += 40
         time.sleep(0.3)
 
+    if not restaurants:
+        return []
+
+    # ── Korak 2: Konkurentno učitavamo akcije za svaki restoran ──────────────
+    slugs = list(restaurants.keys())
+    total = len(slugs)
+    status_placeholder.info(f"🎯 **{city}**: Učitavam akcije za {total} restorana...")
+    progress = st.progress(0, text=f"0 / {total}")
+
+    def _fetch_one(slug):
+        dynamic = fetch_dynamic_discounts(slug, lat, lon)
+        menu    = fetch_menu_discounts(slug)
+        parts = [p for p in [dynamic if dynamic != "-" else None, menu] if p]
+        return slug, "\n".join(parts) if parts else "-"
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=15) as pool:
+        futures = {pool.submit(_fetch_one, slug): slug for slug in slugs}
+        for fut in as_completed(futures):
+            slug, akcije = fut.result()
+            restaurants[slug]["akcije"] = akcije
+            completed += 1
+            if completed % 10 == 0 or completed == total:
+                progress.progress(completed / total, text=f"{completed} / {total}")
+
+    progress.empty()
     return list(restaurants.values())
 
 
