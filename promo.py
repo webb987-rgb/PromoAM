@@ -117,7 +117,7 @@ def wolt_get(url: str) -> dict | None:
     return None
 
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
-    """Dubinska pretraga za 'formatted_text' unutar dynamic endpoint-a."""
+    """Dubinska pretraga – hvata SVE kartice iz sekcije Deals & Benefits."""
     url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
@@ -128,15 +128,16 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
 
     akcije = set()
 
-    # Rekurzivna funkcija koja traži tvoj JSON format bilo gde u kodu
     def _extract(obj):
         if isinstance(obj, dict):
-            # OVO JE KLJUČ IZ TVOG JSON-a
-            text = obj.get("formatted_text") or obj.get("text") or obj.get("title")
+            # Wolt glavni tekst uvek drži pod "formatted_text" ili "title"
+            text = obj.get("formatted_text") or obj.get("title")
+            
+            # Želimo sve, ali izbacujemo sistemska dugmad iz aplikacije
+            ignore_texts = ["prikaži detalje", "show details", "vidi sve", "see all", "detalji restorana"]
+            
             if text and isinstance(text, str) and len(text) > 3:
-                t_lower = text.lower()
-                # Filtriramo samo one tekstove koji liče na akciju
-                if any(keyword in t_lower for keyword in ["popust", "%", "gratis", "rsd", "akcija", "uštedi", "besplatn"]):
+                if not any(ign in text.lower() for ign in ignore_texts):
                     akcije.add(f"• {text.strip()}")
             
             for v in obj.values():
@@ -186,20 +187,22 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                     akcije_lista = []
                     novo_status = "Ne"
 
+                    # Skupljamo APSOLUTNO SVE bedževe koji postoje na početnoj strani
                     badges = venue.get("badges", [])
                     for badge in badges:
                         txt = badge.get("text", "")
                         if txt:
                             if txt.lower() in ["novo", "new"]:
                                 novo_status = "Da"
-                            elif "%" in txt or "popust" in txt.lower():
-                                akcije_lista.append(f"• {txt}")
+                            else:
+                                akcije_lista.append(f"• {txt}") # Nema više if % in txt... hvata sve!
 
+                    # Skupljamo i dodatne labele
                     label = venue.get("label", "")
                     if label:
                         if label.lower() in ["novo", "new"]:
                             novo_status = "Da"
-                        elif "%" in label or "popust" in label.lower():
+                        else:
                             akcije_lista.append(f"• {label}")
 
                     restaurants[slug] = {
