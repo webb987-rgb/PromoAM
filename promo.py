@@ -137,18 +137,34 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
-    # Pravimo novi session po threadu da izbegnemo thread-safety probleme
-    # ali kopiramo sve headere ukljucujuci cookie iz globalnog sessiona
+    # Kopiraj headere iz globalnog sessiona (ukljucujuci cookie)
     thread_session = requests.Session()
     thread_session.headers.update(dict(session.headers))
-    
-    try:
-        r = thread_session.get(url, timeout=15)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-    except Exception:
-        return []
+
+    # Retry do 3 puta ako dobijemo prazan odgovor (soft rate-limit)
+    data = None
+    for attempt in range(3):
+        try:
+            r = thread_session.get(url, timeout=15)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            # Proveravamo da li ima stvarnih podataka
+            venue_raw = data.get("venue_raw") or {}
+            venue = data.get("venue") or {}
+            has_data = (
+                bool(venue_raw.get("discounts")) or
+                bool(venue.get("banners")) or
+                bool((venue.get("offer_assistant") or {}).get("offer_trackers"))
+            )
+            if has_data:
+                break  # Dobili smo podatke, izlazimo
+            # Prazan odgovor - cekamo pre retry-a
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.0)
     if not data:
         return []
 
@@ -298,9 +314,9 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
     progress_bar = st.progress(0, text=progress_text)
     
     # Batch paralelizam: BATCH_SIZE threadova simultano, pauza između batch-eva
-    # 1600 restorana / 10 po batchu * 0.3s = ~48s umesto 13min
-    BATCH_SIZE = 10
-    BATCH_PAUSE = 0.3  # sekunde između batch-eva
+    # 1600 / 5 * 0.8s = ~256s (~4 min) - dovoljno sporo da ne trigguje rate-limit
+    BATCH_SIZE = 5
+    BATCH_PAUSE = 0.8  # sekunde između batch-eva
 
     completed = 0
     for batch_start in range(0, total, BATCH_SIZE):
