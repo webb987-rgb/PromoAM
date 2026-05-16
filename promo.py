@@ -918,14 +918,21 @@ with tab_scan:
         _cities_snap = list(selected_cities)
         _stop_ev_snap = st.session_state.scan_stop_event
 
+        st.session_state["_scan_status"] = "🔄 Priprema skena..."
+
         def _run_scan_bg():
-            class NullPH:
-                def info(self, *a, **k): pass
-                def warning(self, *a, **k): pass
-                def success(self, *a, **k): pass
-                def error(self, *a, **k): pass
-                def empty(self, *a, **k): pass
-            result = scan_all_cities(_cities_snap, NullPH(), _stop_ev_snap)
+            class LivePH:
+                def info(self, msg, *a, **k):
+                    st.session_state["_scan_status"] = str(msg)
+                def warning(self, msg, *a, **k):
+                    st.session_state["_scan_status"] = "⚠️ " + str(msg)
+                def success(self, msg, *a, **k):
+                    st.session_state["_scan_status"] = "✅ " + str(msg)
+                def error(self, msg, *a, **k):
+                    st.session_state["_scan_status"] = "❌ " + str(msg)
+                def empty(self, *a, **k):
+                    pass
+            result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
             st.session_state["_scan_result"] = result
             st.session_state["_scan_done"] = True
             st.session_state.scan_running = False
@@ -938,7 +945,8 @@ with tab_scan:
     if st.session_state.scan_running:
         elapsed = time.time() - (st.session_state.scan_start_time or time.time())
         m2, s2 = divmod(int(elapsed), 60)
-        st.info(f"🔄 Skeniranje u toku... **{m2:02d}:{s2:02d}** | Klikni ⏹️ Zaustavi da prekineš.")
+        status_msg = st.session_state.get("_scan_status", "🔄 Skeniranje...")
+        st.info(f"🔄 **{m2:02d}:{s2:02d}** | {status_msg}")
         time.sleep(2)
         st.rerun()
 
