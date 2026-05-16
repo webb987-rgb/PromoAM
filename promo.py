@@ -348,9 +348,15 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                             novo_status = "Da"
 
                     # Koordinate restorana – koristimo ih za dynamic API
+                    # Wolt listing vraca location kao {"coordinates": [lon, lat]} (GeoJSON format)
                     location = venue.get("location") or {}
-                    r_lat = location.get("lat") or location.get("latitude") or lat
-                    r_lon = location.get("lon") or location.get("longitude") or lon
+                    coords = location.get("coordinates")  # [lon, lat] u GeoJSON formatu!
+                    if coords and len(coords) >= 2:
+                        r_lon = float(coords[0])
+                        r_lat = float(coords[1])
+                    else:
+                        r_lat = float(location.get("lat") or location.get("latitude") or lat)
+                        r_lon = float(location.get("lon") or location.get("longitude") or lon)
 
                     restaurants[slug] = {
                         "grad":           city_display,
@@ -799,12 +805,18 @@ with tab_scan:
                     Path("_scan_status.txt").write_text("❌ " + str(msg))
                 def empty(self, *a, **k):
                     pass
-            result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
-            # Čuvamo rezultat na disk – session_state nije dostupan iz threada
-            if result is not None and not result.empty:
-                result.to_csv("_scan_result.csv", index=False)
-            Path("_scan_done.txt").write_text("1")
-            Path("_scan_status.txt").write_text("✅ Sken završen!")
+            try:
+                result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
+                if result is not None and not result.empty:
+                    result.to_csv("_scan_result.csv", index=False)
+                    Path("_scan_status.txt").write_text("✅ Sken završen!")
+                else:
+                    Path("_scan_status.txt").write_text("⚠️ Sken završen – nema restorana.")
+            except Exception as e:
+                import traceback
+                Path("_scan_status.txt").write_text(f"❌ GREŠKA: {e}\n{traceback.format_exc()}")
+            finally:
+                Path("_scan_done.txt").write_text("1")
 
         bg = threading.Thread(target=_run_scan_bg, daemon=True)
         bg.start()
