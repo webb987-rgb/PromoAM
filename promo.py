@@ -918,18 +918,18 @@ with tab_scan:
         _cities_snap = list(selected_cities)
         _stop_ev_snap = st.session_state.scan_stop_event
 
-        st.session_state["_scan_status"] = "🔄 Priprema skena..."
+        Path("_scan_status.txt").write_text("🔄 Priprema skena...")
 
         def _run_scan_bg():
             class LivePH:
                 def info(self, msg, *a, **k):
-                    st.session_state["_scan_status"] = str(msg)
+                    Path("_scan_status.txt").write_text(str(msg))
                 def warning(self, msg, *a, **k):
-                    st.session_state["_scan_status"] = "⚠️ " + str(msg)
+                    Path("_scan_status.txt").write_text("⚠️ " + str(msg))
                 def success(self, msg, *a, **k):
-                    st.session_state["_scan_status"] = "✅ " + str(msg)
+                    Path("_scan_status.txt").write_text("✅ " + str(msg))
                 def error(self, msg, *a, **k):
-                    st.session_state["_scan_status"] = "❌ " + str(msg)
+                    Path("_scan_status.txt").write_text("❌ " + str(msg))
                 def empty(self, *a, **k):
                     pass
             result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
@@ -945,7 +945,10 @@ with tab_scan:
     if st.session_state.scan_running:
         elapsed = time.time() - (st.session_state.scan_start_time or time.time())
         m2, s2 = divmod(int(elapsed), 60)
-        status_msg = st.session_state.get("_scan_status", "🔄 Skeniranje...")
+        try:
+            status_msg = Path("_scan_status.txt").read_text()
+        except Exception:
+            status_msg = "🔄 Skeniranje..."
         st.info(f"🔄 **{m2:02d}:{s2:02d}** | {status_msg}")
         time.sleep(2)
         st.rerun()
