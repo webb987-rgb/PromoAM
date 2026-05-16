@@ -814,7 +814,9 @@ with tab_scan:
                     Path("_scan_status.txt").write_text("⚠️ Sken završen – nema restorana.")
             except Exception as e:
                 import traceback
-                Path("_scan_status.txt").write_text(f"❌ GREŠKA: {e}\n{traceback.format_exc()}")
+                tb = traceback.format_exc()
+                Path("_scan_status.txt").write_text(f"❌ GREŠKA: {e}")
+                Path("_scan_error.txt").write_text(f"{e}\n\n{tb}")
             finally:
                 Path("_scan_done.txt").write_text("1")
 
@@ -865,7 +867,14 @@ with tab_scan:
             if _stop_ev.is_set():
                 st.warning("⏹️ Scan je zaustavljen pre završetka.")
             else:
-                st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
+                err_file = Path("_scan_error.txt")
+                if err_file.exists():
+                    err_txt = err_file.read_text()
+                    st.error(f"❌ Scan pukao sa greškom:")
+                    st.code(err_txt)
+                    err_file.unlink(missing_ok=True)
+                else:
+                    st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
 
     df = st.session_state.df_wolt
     if not df.empty:
