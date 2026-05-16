@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 10
+FETCH_WORKERS = 3
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -241,7 +241,7 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
                 break
             if r.status_code == 429:
                 _log_fetch(f"ASS {slug} → 429 retry {attempt}")
-                time.sleep(2 ** attempt)
+                time.sleep(3 + 2 ** attempt)
                 continue
             if r.status_code == 200:
                 if _has_item_discounts(r.json()):
@@ -275,7 +275,7 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
                 break
             if r.status_code == 429:
                 _log_fetch(f"DYN {slug} → 429 retry {attempt}")
-                time.sleep(2 ** attempt)
+                time.sleep(3 + 2 ** attempt)
                 continue
             if r.status_code == 200:
                 parsed = _parse_dynamic_with_item_discount(r.json())
@@ -452,15 +452,21 @@ def _parse_dynamic(data: dict) -> list:
     return list(akcije)
 
 
+def _safe_price(val) -> float:
+    """Sigurno izvlači cenu – ignoruje dict/None vrednosti."""
+    if isinstance(val, (int, float)):
+        return float(val) / 100
+    return 0.0
+
 def _has_item_discounts(data: dict) -> bool:
     for item in data.get("items", []):
-        price = (item.get("base_price") or item.get("price") or 0) / 100
-        orig = (
+        price = _safe_price(item.get("base_price") or item.get("price") or 0)
+        orig  = _safe_price(
             item.get("original_price") or
             item.get("strikethrough_price") or
             item.get("compare_at_price") or
             item.get("unit_price") or 0
-        ) / 100
+        )
         if orig > 0 and orig > price:
             return True
     return False
