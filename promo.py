@@ -17,7 +17,16 @@ from pathlib import Path
 EMAIL_SENDER   = "webb987@gmail.com"
 EMAIL_PASSWORD = "sdehqzbnqefjlomo"   # Gmail App Password
 
-CITIES = ["Beograd", "Novi Sad", "Niš", "Kragujevac"]
+# Koristimo ASCII ključeve da izbegnemo Unicode probleme sa dijakritičnim slovima
+# (npr. 'š' može biti dva različita Unicode karaktera koji izgledaju isto)
+CITY_KEYS    = ["Beograd", "Novi Sad", "Nis", "Kragujevac"]   # interni ključevi – bez dijakritike
+CITY_DISPLAY = {                                                # za prikaz korisniku
+    "Beograd":    "Beograd",
+    "Novi Sad":   "Novi Sad",
+    "Nis":        "Niš",
+    "Kragujevac": "Kragujevac",
+}
+CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]  # lista za UI (sa dijakritikom)
 
 AMM_FILE   = Path("amm_baza.csv")
 AMM_COLS = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
@@ -47,6 +56,18 @@ def normalize(name: str) -> str:
 
 def local_now() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def display_to_key(display_name: str) -> str:
+    """Konvertuje prikazni naziv grada (sa dijakritikom) u interni ključ (bez dijakritike)."""
+    for key, disp in CITY_DISPLAY.items():
+        if disp == display_name or key == display_name:
+            return key
+    # Fallback: normalizuj i pokušaj matching
+    norm = normalize(display_name)
+    for key in CITY_KEYS:
+        if normalize(key) == norm:
+            return key
+    return display_name  # poslednji fallback
 
 # ─────────────────────────── AMM BAZA ────────────────────────────────────────
 
@@ -102,17 +123,18 @@ session.headers.update(BROWSER_HEADERS)
 if WOLT_COOKIE:
     session.headers["Cookie"] = WOLT_COOKIE
 
+# Interni ključevi (bez dijakritike) → koordinate i slug
 CITY_COORDS = {
     "Beograd":    (44.8178, 20.4569),
     "Novi Sad":   (45.2671, 19.8335),
-    "Niš":        (43.3209, 21.8958),
+    "Nis":        (43.3209, 21.8958),
     "Kragujevac": (44.0128, 20.9114),
 }
 
 CITY_SLUG_MAP = {
     "Beograd":    "belgrade",
     "Novi Sad":   "novi-sad",
-    "Niš":        "nis",
+    "Nis":        "nis",
     "Kragujevac": "kragujevac",
 }
 
@@ -129,6 +151,19 @@ def wolt_get(url: str, extra_headers: dict = None) -> tuple:
     except Exception:
         return None, -1
 
+def make_thread_session() -> requests.Session:
+    """Kreira novu sesiju sa svim headerima uključujući cookie."""
+    s = requests.Session()
+    for k, v in session.headers.items():
+        s.headers[k] = v
+    # Eksplicitno postavi cookie iz session_state ako postoji
+    cookie_val = st.session_state.get("wolt_cookie", "")
+    if cookie_val:
+        s.headers["Cookie"] = cookie_val
+    elif WOLT_COOKIE:
+        s.headers["Cookie"] = WOLT_COOKIE
+    return s
+
 def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
     """
     Cita akcije iz dynamic endpointa.
@@ -138,15 +173,18 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
-    # Kopiraj headere iz globalnog sessiona (ukljucujuci cookie)
-    thread_session = requests.Session()
-    thread_session.headers.update(dict(session.headers))
+    thread_session = make_thread_session()
 
     data = None
     for attempt in range(2):  # max 2 pokusaja, retry se radi na visem nivou
         try:
             r = thread_session.get(url, timeout=15)
+            if r.status_code in (401, 403):
+                return []  # auth problem, nema smisla ponavljati
             if r.status_code != 200:
+                if attempt == 0:
+                    time.sleep(2.0)
+                    continue
                 return []
             data = r.json()
             venue_raw = data.get("venue_raw") or {}
@@ -221,8 +259,7 @@ def fetch_menu_discounts(slug: str) -> dict:
     Koristi assortment endpoint (isti kao Menu Scraper skripta).
     """
     url = f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
-    thread_session = requests.Session()
-    thread_session.headers.update(dict(session.headers))
+    thread_session = make_thread_session()
 
     try:
         r = thread_session.get(url, timeout=15)
@@ -258,14 +295,25 @@ def fetch_menu_discounts(slug: str) -> dict:
         "items": discounted,
     }
 
-def fetch_city(city: str, status_placeholder) -> list[dict]:
-    city_slug = CITY_SLUG_MAP.get(city, normalize(city).replace(" ", "-"))
-    lat, lon  = CITY_COORDS.get(city, (44.8178, 20.4569))
+def fetch_city(city_display: str, status_placeholder) -> list[dict]:
+    # Konvertujemo prikazni naziv u interni ključ (bez dijakritike)
+    city_key  = display_to_key(city_display)
+    city_slug = CITY_SLUG_MAP.get(city_key)
+    coords    = CITY_COORDS.get(city_key)
+
+    if not city_slug or not coords:
+        status_placeholder.error(
+            f"❌ Nepoznat grad: '{city_display}' (ključ: '{city_key}'). "
+            f"Proverite CITY_SLUG_MAP i CITY_COORDS."
+        )
+        return []
+
+    lat, lon = coords
 
     restaurants = {}
     skip = 0
 
-    status_placeholder.info(f"🔍 Učitavam listu restorana za **{city}**...")
+    status_placeholder.info(f"🔍 Učitavam listu restorana za **{city_display}**...")
 
     for page_num in range(30):
         count_before = len(restaurants)
@@ -311,7 +359,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                             if txt.lower() in ["novo", "new"]:
                                 novo_status = "Da"
                             else:
-                                akcije_lista.append(f"• {txt}") # Nema više if % in txt... hvata sve!
+                                akcije_lista.append(f"• {txt}")
 
                     # Skupljamo i dodatne labele
                     label = venue.get("label", "")
@@ -322,17 +370,17 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                             akcije_lista.append(f"• {label}")
 
                     restaurants[slug] = {
-                        "grad":       city,
-                        "naziv":      name,
-                        "slug":       slug,
-                        "status":     status,
-                        "ocena":      str(rating_score),
-                        "dostava":    delivery_time,
-                        "novo":       novo_status,
+                        "grad":        city_display,  # prikazni naziv (sa dijakritikom)
+                        "naziv":       name,
+                        "slug":        slug,
+                        "status":      status,
+                        "ocena":       str(rating_score),
+                        "dostava":     delivery_time,
+                        "novo":        novo_status,
                         "akcije_feed": akcije_lista,
                         "item_popusti": "?",
-                        "link":       f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
-                        "naziv_norm": normalize(name),
+                        "link":        f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
+                        "naziv_norm":  normalize(name),
                     }
 
             if items_in_response > 0:
@@ -341,7 +389,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
 
         new_this_page = len(restaurants) - count_before
         status_placeholder.info(
-            f"🚴 **{city}**: Stranica {page_num+1} – +{new_this_page} novih "
+            f"🚴 **{city_display}**: Stranica {page_num+1} – +{new_this_page} novih "
             f"(ukupno {len(restaurants)}). Tražim akcije..."
         )
 
@@ -353,19 +401,17 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
         time.sleep(0.3)
 
     if not restaurants:
-        status_placeholder.warning(f"⚠️ **{city}**: nije pronađen nijedan restoran.")
+        status_placeholder.warning(f"⚠️ **{city_display}**: nije pronađen nijedan restoran.")
         return []
 
-    # 2. Kopanje po "Ponude i Pogodnosti" za svaki restoran (sa limitom od 5 radnika)
+    # 2. Kopanje po "Ponude i Pogodnosti" za svaki restoran
     slugs = list(restaurants.keys())
     total = len(slugs)
-    progress_text = f"🎯 Učitavam detaljne akcije za {city}..."
+    progress_text = f"🎯 Učitavam detaljne akcije za {city_display}..."
     progress_bar = st.progress(0, text=progress_text)
     
-    # Sekvencijalno sa retry - jedini nacin da pouzdano izvucemo sve akcije
-    # Wolt rate-limituje paralelne zahteve, sekvencijalno je jedino sigurno
     completed = 0
-    failed_slugs = []  # slugovi koji nisu dali podatke, pokusavamo ponovo na kraju
+    failed_slugs = []
 
     for slug in slugs:
         dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
@@ -378,10 +424,10 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
             progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
         time.sleep(random.uniform(0.5, 1.5))
 
-    # Retry za failed slugove - cekamo malo pa pokusamo ponovo
+    # Retry za failed slugove
     if failed_slugs:
         progress_bar.progress(1.0, text=f"🔄 Retry za {len(failed_slugs)} restorana...")
-        time.sleep(5)  # duza pauza pre retry-a
+        time.sleep(5)
         for slug in failed_slugs:
             dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
             if dynamic_akcije:
@@ -391,8 +437,8 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
 
     progress_bar.empty()
 
-    # 3. Item-level provera - sekvencijalno sa random pauzama
-    progress_bar3 = st.progress(0, text=f"🏷️ Proveravam item popuste za {city}...")
+    # 3. Item-level provera
+    progress_bar3 = st.progress(0, text=f"🏷️ Proveravam item popuste za {city_display}...")
     for i, slug in enumerate(slugs):
         try:
             result = fetch_menu_discounts(slug)
@@ -403,7 +449,6 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
         time.sleep(random.uniform(0.3, 0.8))
     progress_bar3.empty()
 
-    # Brisanje pomoćnog ključa pre nego što ga vratimo
     for r in restaurants.values():
         r.pop("akcije_feed", None)
 
@@ -543,7 +588,7 @@ with tab_scan:
             st.success(f"✅ Scan završen! Pronađeno **{len(df)}** restorana, "
                        f"od toga **{len(df[df['akcije'] != '-'])}** sa akcijama.")
         else:
-            st.error("❌ Scan nije vratio podatke. Proveri internet konekciju.")
+            st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
 
     df = st.session_state.df_wolt
     if not df.empty:
@@ -1016,6 +1061,18 @@ Cookie traje ~24h, posle toga ga osvežiti.
         session.headers["Cookie"] = st.session_state["wolt_cookie"]
 
     st.markdown("---")
+
+    # ── Dijagnostika: provjera city mapiranja ─────────────────────────────────
+    st.markdown("#### 🗺️ Dijagnostika mapiranja gradova")
+    diag_data = []
+    for key in CITY_KEYS:
+        disp  = CITY_DISPLAY.get(key, "?")
+        slug  = CITY_SLUG_MAP.get(key, "NIJE NAĐEN ❌")
+        coord = CITY_COORDS.get(key, "NIJE NAĐEN ❌")
+        diag_data.append({"Ključ": key, "Prikaz": disp, "Slug": slug, "Koordinate": str(coord)})
+    st.dataframe(pd.DataFrame(diag_data), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
     st.markdown("### 🔧 Debug – Sirovi API odgovor za restoran")
     st.info(
         "Unesi slug restorana (deo URL-a: `wolt.com/en/srb/nis/restaurant/**SLUG**`) "
@@ -1026,12 +1083,14 @@ Cookie traje ~24h, posle toga ga osvežiti.
     with dc1:
         debug_slug = st.text_input("Slug restorana:", placeholder="npr. mcdonalds-nis", key="debug_slug")
     with dc2:
-        debug_city = st.selectbox("Grad:", CITIES, key="debug_city")
+        debug_city_display = st.selectbox("Grad:", CITIES, key="debug_city")
 
     if st.button("🔍 Dohvati sirovi JSON", key="debug_fetch") and debug_slug:
-        lat, lon = CITY_COORDS.get(debug_city, (44.8178, 20.4569))
-        city_slug = CITY_SLUG_MAP.get(debug_city, "nis")
+        debug_city_key = display_to_key(debug_city_display)
+        lat, lon = CITY_COORDS.get(debug_city_key, (44.8178, 20.4569))
+        city_slug = CITY_SLUG_MAP.get(debug_city_key, "belgrade")
 
+        st.info(f"Koristim: ključ=`{debug_city_key}`, slug=`{city_slug}`, lat={lat}, lon={lon}")
         st.markdown("---")
 
         # ── 1. Feed (listing) podaci ──────────────────────────────────────
@@ -1039,7 +1098,6 @@ Cookie traje ~24h, posle toga ga osvežiti.
         feed_url = f"https://restaurant-api.wolt.com/v3/venues/slug/{debug_slug}"
         feed_data, feed_status = wolt_get(feed_url)
         if feed_data:
-            # Izvuci badges i label direktno
             results = feed_data.get("results", [{}])
             venue_info = results[0] if results else {}
             badges = venue_info.get("badges", [])
@@ -1064,11 +1122,9 @@ Cookie traje ~24h, posle toga ga osvežiti.
             with st.expander("Pun JSON (dynamic)", expanded=True):
                 st.json(dyn_data)
 
-            # Pokazi sve kljuceve prvog nivoa
             st.markdown("**Ključevi na vrhu odgovora:**")
             st.write(list(dyn_data.keys()))
 
-            # Traži sekcije koje sadrže promocije
             sections = dyn_data.get("sections", [])
             st.markdown(f"**Broj sekcija:** {len(sections)}")
             for i, sec in enumerate(sections):
