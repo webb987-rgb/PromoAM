@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 10
+FETCH_WORKERS = 100
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
