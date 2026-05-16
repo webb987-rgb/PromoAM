@@ -1,4 +1,5 @@
 import re
+import random
 import json
 import time
 import datetime
@@ -170,40 +171,43 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
         "prikaži detalje", "show details", "vidi sve", "see all",
         "detalji restorana", "restaurant details", "more", "još",
         "schedule order", "naruči", "see menu", "add {amount} more",
+        "try for 30 days for free!", "get rsd0 delivery fee & more!",
     }
 
-    def add(text):
+    def add(text, wolt_plus=False):
         t = (text or "").strip()
-        if t and len(t) > 3 and t.lower() not in ignore_texts:
-            akcije.add(f"• {t}")
+        if not t or len(t) <= 3 or t.lower() in ignore_texts:
+            return
+        prefix = "• [Wolt+] " if wolt_plus else "• "
+        akcije.add(f"{prefix}{t}")
 
-    # Potvrdjeni putevi iz JSON-a (venue_raw.discounts[]):
-    #   .banner.formatted_text  -> glavni tekst
-    #   .description.title      -> alternativni tekst
+    # venue_raw.discounts[] - glavne kampanje
     venue_raw = data.get("venue_raw") or {}
     for disc in venue_raw.get("discounts", []):
         if not isinstance(disc, dict):
             continue
+        is_wolt_plus = disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False)
         banner = disc.get("banner") or {}
-        add(banner.get("formatted_text"))
+        add(banner.get("formatted_text"), wolt_plus=is_wolt_plus)
         desc = disc.get("description") or {}
-        add(desc.get("title"))
+        add(desc.get("title"), wolt_plus=is_wolt_plus)
 
-    # venue.banners[].discount.formatted_text
+    # venue.banners[] - vizuelni baneri
     venue = data.get("venue") or {}
     for banner in venue.get("banners", []):
         if not isinstance(banner, dict):
             continue
+        is_wolt_plus = banner.get("show_wolt_plus", False)
         disc = banner.get("discount") or {}
-        add(disc.get("formatted_text"))
+        add(disc.get("formatted_text"), wolt_plus=is_wolt_plus)
 
-    # venue.offer_assistant.offer_trackers[].title  (vidljivo u Network tabu)
+    # venue.offer_assistant.offer_trackers[]
     offer_assistant = venue.get("offer_assistant") or {}
     for tracker in offer_assistant.get("offer_trackers", []):
         if not isinstance(tracker, dict):
             continue
-        add(tracker.get("title"))
-        add(tracker.get("applied_subtitle"))
+        is_wolt_plus = tracker.get("offer_type") == "wolt_plus" or tracker.get("show_wolt_plus", False)
+        add(tracker.get("title"), wolt_plus=is_wolt_plus)
 
     return list(akcije)
 
@@ -326,6 +330,7 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                         "dostava":    delivery_time,
                         "novo":       novo_status,
                         "akcije_feed": akcije_lista,
+                        "item_popusti": "?",
                         "link":       f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm": normalize(name),
                     }
@@ -371,20 +376,32 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
         completed += 1
         if completed % 10 == 0 or completed == total:
             progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
-        time.sleep(0.2)
+        time.sleep(random.uniform(0.5, 1.5))
 
     # Retry za failed slugove - cekamo malo pa pokusamo ponovo
     if failed_slugs:
         progress_bar.progress(1.0, text=f"🔄 Retry za {len(failed_slugs)} restorana...")
-        time.sleep(3)  # duza pauza pre retry-a
+        time.sleep(5)  # duza pauza pre retry-a
         for slug in failed_slugs:
             dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
             if dynamic_akcije:
                 sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
                 restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
-            time.sleep(0.3)
+            time.sleep(random.uniform(1.0, 2.0))
 
     progress_bar.empty()
+
+    # 3. Item-level provera - sekvencijalno sa random pauzama
+    progress_bar3 = st.progress(0, text=f"🏷️ Proveravam item popuste za {city}...")
+    for i, slug in enumerate(slugs):
+        try:
+            result = fetch_menu_discounts(slug)
+            restaurants[slug]["item_popusti"] = "Da" if result["has_discounts"] else "Ne"
+        except Exception:
+            restaurants[slug]["item_popusti"] = "Ne"
+        progress_bar3.progress((i + 1) / total, text=f"🏷️ Item popusti... ({i+1}/{total})")
+        time.sleep(random.uniform(0.3, 0.8))
+    progress_bar3.empty()
 
     # Brisanje pomoćnog ključa pre nego što ga vratimo
     for r in restaurants.values():
@@ -587,9 +604,16 @@ with tab_scan:
             )
             fdf = fdf[mask]
 
-        samo_item_pop = st.checkbox("🏷️ Samo sa item popustima", value=False, key="scan_item_pop")
+        fc_extra1, fc_extra2 = st.columns(2)
+        with fc_extra1:
+            samo_item_pop = st.checkbox("🏷️ Samo sa item popustima", value=False, key="scan_item_pop")
+        with fc_extra2:
+            samo_wolt_plus = st.checkbox("💙 Samo sa Wolt+ akcijama", value=False, key="scan_wolt_plus")
+
         if samo_item_pop and "item_popusti" in fdf.columns:
             fdf = fdf[fdf["item_popusti"] == "Da"]
+        if samo_wolt_plus:
+            fdf = fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)]
 
         st.caption(f"Prikazano: **{len(fdf)}** restorana")
 
