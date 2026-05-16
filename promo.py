@@ -206,57 +206,64 @@ def make_thread_session() -> requests.Session:
 
 # ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
 
-def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str, str]:
+def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, feed_has_promo: bool, stop_event: threading.Event) -> tuple[str, str, str]:
     """
-    OPTIMIZOVANO: Dynamic se radi prvi – ako nađe item_discount efekat, preskačemo assortment.
-    Timeout smanjen 12s→5s. Max retry 3→2. Ukupno ~60% manje HTTP zahteva.
+    OPTIMIZOVANO:
+    - Ako feed već ima promo tekst (badge/label/tag), preskačemo dynamic poziv
+      i radimo samo assortment (za item_popusti detekciju)
+    - Ako feed nema ništa, radimo dynamic prvi – ako nađe item_discount, preskačemo assortment
+    - Timeout 5s, max 2 retry
     """
     if stop_event.is_set():
         return slug, "-", "Ne"
 
     ts = make_thread_session()
 
-    # ── 1. Dynamic PRVO – akcije tekst + detekcija item popusta ──────────────
     akcije_str = "-"
     item_popusti = "Ne"
     dynamic_has_item_disc = False
 
-    dyn_url = (
-        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
-        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
-    )
-    for attempt in range(2):
-        if stop_event.is_set():
-            break
-        try:
-            r = ts.get(dyn_url, timeout=5)
-            if r.status_code in (401, 403):
-                break
-            if r.status_code == 429:
-                time.sleep(1.5 ** attempt)
-                continue
-            if r.status_code == 200:
-                dyn_data = r.json()
-                parsed = _parse_dynamic_with_item_discount(dyn_data)
-                dynamic_has_item_disc = _dynamic_has_item_discount(dyn_data)
-                if dynamic_has_item_disc:
-                    item_popusti = "Da"
-                combined = list(dict.fromkeys(feed_akcije + parsed))
-                akcije_str = "\n".join(combined) if combined else "-"
-                break
-            break
-        except Exception:
-            if attempt < 1:
-                time.sleep(0.2)
+    if feed_has_promo:
+        # ── Brza putanja: feed već ima akcije, preskačemo dynamic ─────────────
+        akcije_str = "\n".join(feed_akcije)
+        # Još uvek proveravamo assortment za item_popusti
     else:
-        if feed_akcije:
-            akcije_str = "\n".join(feed_akcije)
+        # ── Spora putanja: nema feed info, pitamo dynamic endpoint ────────────
+        dyn_url = (
+            f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
+            f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
+        )
+        for attempt in range(2):
+            if stop_event.is_set():
+                break
+            try:
+                r = ts.get(dyn_url, timeout=5)
+                if r.status_code in (401, 403):
+                    break
+                if r.status_code == 429:
+                    time.sleep(1.5 ** attempt)
+                    continue
+                if r.status_code == 200:
+                    dyn_data = r.json()
+                    parsed = _parse_dynamic_with_item_discount(dyn_data)
+                    dynamic_has_item_disc = _dynamic_has_item_discount(dyn_data)
+                    if dynamic_has_item_disc:
+                        item_popusti = "Da"
+                    combined = list(dict.fromkeys(feed_akcije + parsed))
+                    akcije_str = "\n".join(combined) if combined else "-"
+                    break
+                break
+            except Exception:
+                if attempt < 1:
+                    time.sleep(0.2)
+        else:
+            if feed_akcije:
+                akcije_str = "\n".join(feed_akcije)
 
     if stop_event.is_set():
         return slug, akcije_str, item_popusti
 
-    # ── 2. Assortment – SAMO ako dynamic NIJE već detektovao item popuste ─────
-    # Eliminiše ~80% assortment poziva i prepolovljuje ukupan broj HTTP zahteva
+    # ── Assortment – SAMO ako dynamic NIJE već detektovao item popuste ────────
     if not dynamic_has_item_disc:
         ass_url = (
             f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
@@ -566,33 +573,62 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
 
                     feed_akcije = []
                     novo_status = "Ne"
-                    for badge in venue.get("badges", []):
-                        txt = badge.get("text", "")
-                        if txt:
-                            if txt.lower() in ["novo", "new"]:
-                                novo_status = "Da"
-                            else:
-                                feed_akcije.append(f"• {txt}")
-                    label = venue.get("label", "")
-                    if label:
-                        if label.lower() in ["novo", "new"]:
+                    seen_feed = set()
+
+                    def _feed_add(txt):
+                        t = (txt or "").strip()
+                        if not t or len(t) <= 2:
+                            return
+                        if t.lower() in ["novo", "new"]:
+                            nonlocal novo_status
                             novo_status = "Da"
-                        else:
-                            feed_akcije.append(f"• {label}")
+                            return
+                        k = t.lower()
+                        if k not in seen_feed:
+                            seen_feed.add(k)
+                            feed_akcije.append(f"• {t}")
+
+                    # badges[] – tekst i npr. "40% off"
+                    for badge in venue.get("badges", []):
+                        _feed_add(badge.get("text", ""))
+                        _feed_add(badge.get("label", ""))
+
+                    # label – kratka promo poruka na kartici
+                    _feed_add(venue.get("label", ""))
+
+                    # tag – marketing tag (npr. "Free delivery", "20% off")
+                    _feed_add(venue.get("tag", ""))
+
+                    # marketing_tags[] – lista marketing tagova
+                    for mt in (venue.get("marketing_tags") or []):
+                        if isinstance(mt, dict):
+                            _feed_add(mt.get("text") or mt.get("label") or "")
+                        elif isinstance(mt, str):
+                            _feed_add(mt)
+
+                    # short_description – ponekad sadrži promo tekst
+                    sd = venue.get("short_description") or ""
+                    promo_kw = ["off", "popust", "free", "besplatno", "gratis", "%", "discount"]
+                    if any(kw in sd.lower() for kw in promo_kw):
+                        _feed_add(sd)
+
+                    # feed_has_promo – flag koji koristimo u _fetch_one da preskočimo dynamic
+                    feed_has_promo = bool(feed_akcije)
 
                     restaurants[slug] = {
-                        "grad":         city_display,
-                        "naziv":        name,
-                        "slug":         slug,
-                        "status":       status_obj,
-                        "ocena":        str(r_score),
-                        "dostava":      delivery,
-                        "novo":         novo_status,
-                        "_feed_akcije": feed_akcije,
-                        "item_popusti": "Ne",
-                        "akcije":       "-",
-                        "link":         f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
-                        "naziv_norm":   normalize(name),
+                        "grad":           city_display,
+                        "naziv":          name,
+                        "slug":           slug,
+                        "status":         status_obj,
+                        "ocena":          str(r_score),
+                        "dostava":        delivery,
+                        "novo":           novo_status,
+                        "_feed_akcije":   feed_akcije,
+                        "_feed_has_promo": feed_has_promo,
+                        "item_popusti":   "Ne",
+                        "akcije":         "-",
+                        "link":           f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
+                        "naziv_norm":     normalize(name),
                     }
 
         new_this_page = len(restaurants) - count_before
@@ -627,6 +663,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 lat,
                 lon,
                 restaurants[slug]["_feed_akcije"],
+                restaurants[slug].get("_feed_has_promo", False),
                 stop_event,
             ): slug
             for slug in slugs
