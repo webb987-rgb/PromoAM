@@ -252,43 +252,47 @@ def _parse_dynamic(data: dict) -> tuple[list, bool]:
 
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list,
-               stop_event: threading.Event) -> tuple[str, str, str]:
+               stop_event: threading.Event) -> tuple[str, str, str, str]:
     """
     Fetchuje akcije za jedan restoran ISKLJUČIVO iz dynamic endpointa.
-    feed_akcije parametar se ignoriše – koristi se samo dynamic API.
+    Vraća (slug, akcije_str, item_popusti, status_log)
     """
     if stop_event.is_set():
-        return slug, "-", "Ne"
+        return slug, "-", "Ne", "stopped"
 
     ts = make_thread_session()
     akcije_str   = "-"
     item_popusti = "Ne"
+    status_log   = "?"
 
-    # ── Dynamic endpoint – jedini izvor akcija ────────────────────────────────
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
     for attempt in range(3):
         if stop_event.is_set():
-            return slug, "-", "Ne"
+            return slug, "-", "Ne", "stopped"
         try:
-            r = ts.get(dyn_url, timeout=8)
+            r = ts.get(dyn_url, timeout=15)
             if r.status_code == 200:
                 parsed, ima_item = _parse_dynamic(r.json())
                 if ima_item:
                     item_popusti = "Da"
                 akcije_str = "\n".join(parsed) if parsed else "-"
+                status_log = f"ok({len(parsed)})"
                 break
             elif r.status_code == 429:
+                status_log = f"429(attempt{attempt})"
                 time.sleep(2 ** attempt)
             else:
+                status_log = f"http{r.status_code}"
                 break
-        except Exception:
+        except Exception as e:
+            status_log = f"exc:{type(e).__name__}"
             if attempt < 2:
-                time.sleep(0.3)
+                time.sleep(0.5)
 
-    return slug, akcije_str, item_popusti
+    return slug, akcije_str, item_popusti, status_log
 
 
 # ─────────────────────────── FETCH GRAD ──────────────────────────────────────
@@ -383,6 +387,9 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
 
     status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
 
+    from collections import Counter
+    status_counter = Counter()
+
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
         futures = {
             executor.submit(
@@ -401,17 +408,29 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
             try:
-                slug, akcije_str, item_pop = future.result()
+                slug, akcije_str, item_pop, status_log = future.result()
                 restaurants[slug]["akcije"]       = akcije_str
                 restaurants[slug]["item_popusti"] = item_pop
-            except Exception:
-                pass
+                # Grupiši status za dijagnostiku
+                key = status_log.split("(")[0]  # "ok", "429", "http403", "exc:..."
+                status_counter[key] += 1
+            except Exception as e:
+                status_counter[f"future_exc:{type(e).__name__}"] += 1
 
             completed += 1
-            if completed % 10 == 0 or completed == total:
+            if completed % 20 == 0 or completed == total:
                 status_placeholder.info(
-                    f"⚡ **{city_display}**: {completed}/{total} restorana obrađeno..."
+                    f"⚡ **{city_display}**: {completed}/{total} | "
+                    + " | ".join(f"{k}:{v}" for k, v in status_counter.most_common())
                 )
+
+    # Prikaži finalnu statistiku
+    sa_akcijama = sum(1 for r in restaurants.values() if r["akcije"] != "-")
+    status_placeholder.info(
+        f"📊 **{city_display}** – statistika API odgovora: "
+        + " | ".join(f"{k}:{v}" for k, v in status_counter.most_common())
+        + f" | sa_akcijama:{sa_akcijama}/{total}"
+    )
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
