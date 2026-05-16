@@ -587,9 +587,13 @@ with tab_scan:
             )
             fdf = fdf[mask]
 
+        samo_item_pop = st.checkbox("🏷️ Samo sa item popustima", value=False, key="scan_item_pop")
+        if samo_item_pop and "item_popusti" in fdf.columns:
+            fdf = fdf[fdf["item_popusti"] == "Da"]
+
         st.caption(f"Prikazano: **{len(fdf)}** restorana")
 
-        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "akcije", "link"]
+        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "item_popusti", "akcije", "link"]
         display_cols = [c for c in display_cols if c in fdf.columns]
 
         st.dataframe(
