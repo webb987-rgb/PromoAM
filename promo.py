@@ -210,12 +210,18 @@ def make_thread_session() -> requests.Session:
 
 # ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
 
+# Log fajl za debug fetch-a
+_fetch_log_lock = threading.Lock()
+
+def _log_fetch(msg: str):
+    try:
+        with _fetch_log_lock:
+            with open("_fetch_debug.log", "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+    except Exception:
+        pass
+
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str, str]:
-    """
-    Jedan thread: proverava i assortment (item_popusti) i dynamic (akcije tekst).
-    - Assortment: original_price > price → item_popusti = "Da"
-    - Dynamic: banneri, discounts (uključujući item_discount efekat), offer_trackers → akcije_str
-    """
     if stop_event.is_set():
         return slug, "-", "Ne"
 
@@ -223,61 +229,73 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
 
     # ── 1. Assortment – item_popusti ──────────────────────────────────────────
     item_popusti = "Ne"
-    ass_url = (
-        f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
-    )
+    ass_url = f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
+
     for attempt in range(3):
         if stop_event.is_set():
             break
         try:
             r = ts.get(ass_url, timeout=12)
             if r.status_code in (401, 403):
+                _log_fetch(f"ASS {slug} → {r.status_code} (auth fail)")
                 break
             if r.status_code == 429:
+                _log_fetch(f"ASS {slug} → 429 retry {attempt}")
                 time.sleep(2 ** attempt)
                 continue
             if r.status_code == 200:
                 if _has_item_discounts(r.json()):
                     item_popusti = "Da"
                 break
+            _log_fetch(f"ASS {slug} → {r.status_code}")
             break
-        except Exception:
+        except Exception as e:
+            _log_fetch(f"ASS {slug} → EXC {e}")
             if attempt < 2:
                 time.sleep(0.3)
 
     if stop_event.is_set():
         return slug, "-", item_popusti
 
-    # ── 2. Dynamic – akcije tekst (banneri + item_discount efekti) ────────────
+    # ── 2. Dynamic – akcije tekst ─────────────────────────────────────────────
     akcije_str = "-"
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
+
+    dyn_ok = False
     for attempt in range(3):
         if stop_event.is_set():
             break
         try:
             r = ts.get(dyn_url, timeout=12)
             if r.status_code in (401, 403):
+                _log_fetch(f"DYN {slug} → {r.status_code} (auth fail)")
                 break
             if r.status_code == 429:
+                _log_fetch(f"DYN {slug} → 429 retry {attempt}")
                 time.sleep(2 ** attempt)
                 continue
             if r.status_code == 200:
                 parsed = _parse_dynamic_with_item_discount(r.json())
-                # Spoji feed akcije + dynamic akcije (bez duplikata)
                 combined = list(dict.fromkeys(feed_akcije + parsed))
                 akcije_str = "\n".join(combined) if combined else "-"
+                dyn_ok = True
+                if akcije_str == "-":
+                    _log_fetch(f"DYN {slug} → 200 ali NEMA akcija (parsed={parsed}, feed={feed_akcije})")
                 break
+            _log_fetch(f"DYN {slug} → {r.status_code}")
             break
-        except Exception:
+        except Exception as e:
+            _log_fetch(f"DYN {slug} → EXC {e}")
             if attempt < 2:
                 time.sleep(0.3)
-    else:
-        # Ako dynamic nije dostupan, bar koristi feed_akcije
-        if feed_akcije:
-            akcije_str = "\n".join(feed_akcije)
+
+    # Fallback na feed_akcije ako dynamic nije vratio ništa
+    if not dyn_ok and feed_akcije:
+        akcije_str = "\n".join(feed_akcije)
+        _log_fetch(f"DYN {slug} → fallback na feed_akcije: {feed_akcije}")
 
     return slug, akcije_str, item_popusti
 
@@ -1658,3 +1676,42 @@ Cookie traje ~24h.
                 st.json(loyalty_data)
         else:
             st.warning(f"Loyalty endpoint nije vratio podatke. HTTP status: {loyalty_status}")
+
+    st.markdown("---")
+    st.markdown("### 📋 Fetch Debug Log")
+    st.markdown("Log svih API poziva iz poslednjeg skena (samo restorani sa greškom ili bez akcija).")
+    col_log1, col_log2 = st.columns([1, 1])
+    with col_log1:
+        if st.button("🔄 Osveži log", key="refresh_log"):
+            st.rerun()
+    with col_log2:
+        if st.button("🗑️ Obriši log", key="clear_log"):
+            Path("_fetch_debug.log").unlink(missing_ok=True)
+            st.success("Log obrisan.")
+    try:
+        log_content = Path("_fetch_debug.log").read_text(encoding="utf-8")
+        if log_content.strip():
+            lines = log_content.strip().split("\n")
+            st.markdown(f"**{len(lines)} linija u logu**")
+            # Grupiši po tipu greške
+            auth_fails = [l for l in lines if "auth fail" in l]
+            no_akcija  = [l for l in lines if "NEMA akcija" in l]
+            errors     = [l for l in lines if "EXC" in l or "→ 4" in l or "→ 5" in l]
+            if auth_fails:
+                st.error(f"🔐 **{len(auth_fails)} auth grešaka (401/403)** — cookie možda istekao!")
+                with st.expander(f"Auth greške ({len(auth_fails)})"):
+                    st.text("\n".join(auth_fails[:50]))
+            if no_akcija:
+                st.warning(f"🔍 **{len(no_akcija)} restorana sa 200 ali bez akcija**")
+                with st.expander(f"Bez akcija ({len(no_akcija)})"):
+                    st.text("\n".join(no_akcija[:100]))
+            if errors:
+                st.warning(f"⚠️ **{len(errors)} ostalih grešaka**")
+                with st.expander(f"Ostale greške ({len(errors)})"):
+                    st.text("\n".join(errors[:50]))
+            if not auth_fails and not no_akcija and not errors:
+                st.success("✅ Nema grešaka u logu!")
+        else:
+            st.info("Log je prazan. Pokreni sken pa osvježi.")
+    except FileNotFoundError:
+        st.info("Log fajl ne postoji. Pokreni sken pa osvježi.")
