@@ -208,16 +208,16 @@ def make_thread_session() -> requests.Session:
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str, str]:
     """
-    Jedan thread: proverava SAMO item-level popuste (assortment endpoint).
-    Ulazi u svaki restoran, gleda ceo meni – ako ijedan proizvod ima
-    original_price > price, restoran dobija item_popusti = "Da".
-    Dynamic endpoint se ne koristi uopšte.
+    Jedan thread: proverava i assortment (item_popusti) i dynamic (akcije tekst).
+    - Assortment: original_price > price → item_popusti = "Da"
+    - Dynamic: banneri, discounts (uključujući item_discount efekat), offer_trackers → akcije_str
     """
     if stop_event.is_set():
         return slug, "-", "Ne"
 
     ts = make_thread_session()
 
+    # ── 1. Assortment – item_popusti ──────────────────────────────────────────
     item_popusti = "Ne"
     ass_url = (
         f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
@@ -241,8 +241,113 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
             if attempt < 2:
                 time.sleep(0.3)
 
-    # akcije_str ostaje "-" – ne tražimo tekst akcija, samo item level DA/NE
-    return slug, "-", item_popusti
+    if stop_event.is_set():
+        return slug, "-", item_popusti
+
+    # ── 2. Dynamic – akcije tekst (banneri + item_discount efekti) ────────────
+    akcije_str = "-"
+    dyn_url = (
+        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
+        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
+    )
+    for attempt in range(3):
+        if stop_event.is_set():
+            break
+        try:
+            r = ts.get(dyn_url, timeout=12)
+            if r.status_code in (401, 403):
+                break
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code == 200:
+                parsed = _parse_dynamic_with_item_discount(r.json())
+                # Spoji feed akcije + dynamic akcije (bez duplikata)
+                combined = list(dict.fromkeys(feed_akcije + parsed))
+                akcije_str = "\n".join(combined) if combined else "-"
+                break
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.3)
+    else:
+        # Ako dynamic nije dostupan, bar koristi feed_akcije
+        if feed_akcije:
+            akcije_str = "\n".join(feed_akcije)
+
+    return slug, akcije_str, item_popusti
+
+
+def _parse_dynamic_with_item_discount(data: dict) -> list:
+    """
+    Proširena verzija _parse_dynamic koja parsira i item_discount efekte
+    iz venue_raw.discounts[].effects.item_discount.
+    """
+    akcije = []
+    seen = set()
+
+    ignore_texts = {
+        "prikaži detalje", "show details", "vidi sve", "see all",
+        "detalji restorana", "restaurant details", "more", "još",
+        "schedule order", "naruči", "see menu", "add {amount} more",
+        "try for 30 days for free!", "get rsd0 delivery fee & more!",
+    }
+
+    def add(text, wolt_plus=False):
+        t = (text or "").strip()
+        if not t or len(t) <= 3 or t.lower() in ignore_texts:
+            return
+        prefix = "• [Wolt+] " if wolt_plus else "• "
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            akcije.append(f"{prefix}{t}")
+
+    venue_raw = data.get("venue_raw") or {}
+
+    for disc in venue_raw.get("discounts", []):
+        if not isinstance(disc, dict):
+            continue
+        is_wp = disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False)
+
+        # Banner tekst
+        banner = disc.get("banner") or {}
+        add(banner.get("formatted_text"), wolt_plus=is_wp)
+
+        # Description title
+        desc = disc.get("description") or {}
+        add(desc.get("title"), wolt_plus=is_wp)
+
+        # ── item_discount efekat ──────────────────────────────────────────────
+        effects = disc.get("effects") or {}
+        item_disc = effects.get("item_discount")
+        if item_disc and isinstance(item_disc, dict):
+            fraction = item_disc.get("fraction")
+            if fraction and float(fraction) > 0:
+                pct = int(round(float(fraction) * 100))
+                # Pokušaj da nađemo naziv kampanje iz opisa ili bannera
+                promo_name = desc.get("title") or banner.get("formatted_text") or ""
+                if promo_name:
+                    add(promo_name, wolt_plus=is_wp)
+                else:
+                    add(f"{pct}% popust na izabrane artikle", wolt_plus=is_wp)
+
+    venue = data.get("venue") or {}
+    for ban in venue.get("banners", []):
+        if not isinstance(ban, dict):
+            continue
+        is_wp = ban.get("show_wolt_plus", False)
+        disc = ban.get("discount") or {}
+        add(disc.get("formatted_text"), wolt_plus=is_wp)
+
+    offer_assistant = venue.get("offer_assistant") or {}
+    for tracker in offer_assistant.get("offer_trackers", []):
+        if not isinstance(tracker, dict):
+            continue
+        is_wp = tracker.get("offer_type") == "wolt_plus" or tracker.get("show_wolt_plus", False)
+        add(tracker.get("title"), wolt_plus=is_wp)
+
+    return akcije
 
 def _parse_dynamic(data: dict) -> list:
     akcije = set()
