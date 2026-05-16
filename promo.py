@@ -25,9 +25,17 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 60   # povećano sa 10 → 60 (6x brže); ako dobijaš 429, smanji na 40
+FETCH_WORKERS = 10
 
-EMAIL_IGNORE_PROMOS = []  # Nema filtera – prikazujemo SVE akcije
+EMAIL_IGNORE_PROMOS = [
+    # Samo masovne delivery fee akcije koje imaju maltene svi restorani
+    "0 din delivery fee for 14 days",
+    "0 din delivery fee",
+    "free delivery for 14 days",
+    "besplatna dostava 14 dana",
+    "besplatna dostava",
+    # NE filtriramo: item popuste, basket popuste, % popuste – to su prave akcije
+]
 
 AMM_FILE   = Path("amm_baza.csv")
 AMM_COLS   = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
@@ -82,11 +90,11 @@ def is_ignored_promo(text: str) -> bool:
     return False
 
 def filter_akcije_for_email(akcije_str: str) -> str:
-    """Vraća sve akcije bez ikakvog filtera."""
     if not akcije_str or akcije_str == "-":
         return "-"
     lines = [l for l in akcije_str.split("\n") if l.strip()]
-    return "\n".join(lines) if lines else "-"
+    filtered = [l for l in lines if not is_ignored_promo(l)]
+    return "\n".join(filtered) if filtered else "-"
 
 # ─────────────────────────── PERMANENTNA BAZA SKENA ─────────────────────────
 
@@ -198,102 +206,242 @@ def make_thread_session() -> requests.Session:
 
 # ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
 
-def _parse_dynamic(data: dict) -> tuple[list, bool]:
+def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str, str]:
     """
-    Parsira dynamic endpoint i vraća (lista_akcija, ima_item_popust).
-
-    Čita ISKLJUČIVO formatted_text iz dve lokacije:
-      1. venue.banners[N].discount.formatted_text
-      2. venue_raw.discounts[N].banner.formatted_text
-
-    Svaki pronađeni tekst = jedna akcija. Duplikati se preskačaju.
-    ima_item_popust = True ako bilo koja akcija sadrži "discount on selected".
-    """
-    akcije = []
-    seen   = set()
-    ima_item_popust = False
-
-    def add(text, wolt_plus=False):
-        t = (text or "").strip()
-        if not t:
-            return
-        prefix = "• [Wolt+] " if wolt_plus else "• "
-        key = t.lower()
-        if key not in seen:
-            seen.add(key)
-            akcije.append(f"{prefix}{t}")
-            if "discount on selected" in key or "popust na izabrane" in key:
-                nonlocal ima_item_popust
-                ima_item_popust = True
-
-    # ── 1. venue.banners[N].discount.formatted_text ───────────────────────────
-    venue = data.get("venue") or {}
-    for ban in venue.get("banners", []):
-        if not isinstance(ban, dict):
-            continue
-        is_wp = bool(ban.get("show_wolt_plus"))
-        disc  = ban.get("discount") or {}
-        add((disc.get("formatted_text") or "").strip(), wolt_plus=is_wp)
-
-    # ── 2. venue_raw.discounts[N].banner.formatted_text ──────────────────────
-    venue_raw = data.get("venue_raw") or {}
-    for disc in venue_raw.get("discounts", []):
-        if not isinstance(disc, dict):
-            continue
-        is_wp = bool(
-            disc.get("has_wolt_plus") or
-            (disc.get("banner") or {}).get("show_wolt_plus") or
-            (disc.get("conditions") or {}).get("has_wolt_plus")
-        )
-        banner = disc.get("banner") or {}
-        add((banner.get("formatted_text") or "").strip(), wolt_plus=is_wp)
-
-    return akcije, ima_item_popust
-
-
-def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list,
-               stop_event: threading.Event) -> tuple[str, str, str, str]:
-    """
-    Fetchuje akcije za jedan restoran ISKLJUČIVO iz dynamic endpointa.
-    Vraća (slug, akcije_str, item_popusti, status_log)
+    Jedan thread: proverava i assortment (item_popusti) i dynamic (akcije tekst).
+    - Assortment: original_price > price → item_popusti = "Da"
+    - Dynamic: banneri, discounts (uključujući item_discount efekat), offer_trackers → akcije_str
     """
     if stop_event.is_set():
-        return slug, "-", "Ne", "stopped"
+        return slug, "-", "Ne"
 
     ts = make_thread_session()
-    akcije_str   = "-"
-    item_popusti = "Ne"
-    status_log   = "?"
 
+    # ── 1. Assortment – item_popusti ──────────────────────────────────────────
+    item_popusti = "Ne"
+    ass_url = (
+        f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
+    )
+    for attempt in range(3):
+        if stop_event.is_set():
+            break
+        try:
+            r = ts.get(ass_url, timeout=12)
+            if r.status_code in (401, 403):
+                break
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code == 200:
+                if _has_item_discounts(r.json()):
+                    item_popusti = "Da"
+                break
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.3)
+
+    if stop_event.is_set():
+        return slug, "-", item_popusti
+
+    # ── 2. Dynamic – akcije tekst (banneri + item_discount efekti) ────────────
+    akcije_str = "-"
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
     for attempt in range(3):
         if stop_event.is_set():
-            return slug, "-", "Ne", "stopped"
+            break
         try:
-            r = ts.get(dyn_url, timeout=15)
-            if r.status_code == 200:
-                parsed, ima_item = _parse_dynamic(r.json())
-                if ima_item:
-                    item_popusti = "Da"
-                akcije_str = "\n".join(parsed) if parsed else "-"
-                status_log = f"ok({len(parsed)})"
+            r = ts.get(dyn_url, timeout=12)
+            if r.status_code in (401, 403):
                 break
-            elif r.status_code == 429:
-                status_log = f"429(attempt{attempt})"
+            if r.status_code == 429:
                 time.sleep(2 ** attempt)
-            else:
-                status_log = f"http{r.status_code}"
+                continue
+            if r.status_code == 200:
+                parsed = _parse_dynamic_with_item_discount(r.json())
+                # Spoji feed akcije + dynamic akcije (bez duplikata)
+                combined = list(dict.fromkeys(feed_akcije + parsed))
+                akcije_str = "\n".join(combined) if combined else "-"
                 break
-        except Exception as e:
-            status_log = f"exc:{type(e).__name__}"
+            break
+        except Exception:
             if attempt < 2:
-                time.sleep(0.5)
+                time.sleep(0.3)
+    else:
+        # Ako dynamic nije dostupan, bar koristi feed_akcije
+        if feed_akcije:
+            akcije_str = "\n".join(feed_akcije)
 
-    return slug, akcije_str, item_popusti, status_log
+    return slug, akcije_str, item_popusti
 
+
+def _parse_dynamic_with_item_discount(data: dict) -> list:
+    """
+    Parsira SVE vrste popusta iz dynamic endpointa:
+    - item_discount  (popust na izabrane artikle, npr. "10% off selected items")
+    - basket_discount (popust na celu korpu, npr. "400 RSD off")
+    - delivery_discount (besplatna dostava)
+    - free_items (gratis proizvodi)
+    Tekst se uzima iz bannera / description / offer_trackers.
+    Ako tekst nije dostupan, generiše se opisni string iz vrednosti efekta.
+    """
+    akcije = []
+    seen = set()
+
+    ignore_texts = {
+        "prikaži detalje", "show details", "vidi sve", "see all",
+        "detalji restorana", "restaurant details", "more", "još",
+        "schedule order", "naruči", "see menu", "add {amount} more",
+        "try for 30 days for free!", "get rsd0 delivery fee & more!",
+    }
+
+    def add(text, wolt_plus=False):
+        t = (text or "").strip()
+        if not t or len(t) <= 3 or t.lower() in ignore_texts:
+            return
+        prefix = "• [Wolt+] " if wolt_plus else "• "
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            akcije.append(f"{prefix}{t}")
+
+    venue_raw = data.get("venue_raw") or {}
+
+    for disc in venue_raw.get("discounts", []):
+        if not isinstance(disc, dict):
+            continue
+        is_wp = (disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False) or (disc.get("conditions") or {}).get("has_wolt_plus") == True)
+
+        banner = disc.get("banner") or {}
+        desc   = disc.get("description") or {}
+
+        # Uzimamo tekst iz bannera ili opisa (primarni izvor)
+        primary_text = banner.get("formatted_text") or desc.get("title") or ""
+        add(primary_text, wolt_plus=is_wp)
+
+        # ── Svi efekti – fallback tekst ako nema primarnog ───────────────────
+        effects = disc.get("effects") or {}
+
+        # item_discount – popust na konkretne artikle
+        item_disc = effects.get("item_discount")
+        if item_disc and isinstance(item_disc, dict):
+            fraction = item_disc.get("fraction")
+            if fraction and float(fraction) > 0:
+                pct = int(round(float(fraction) * 100))
+                fallback = primary_text or f"{pct}% popust na izabrane artikle"
+                add(fallback, wolt_plus=is_wp)
+
+        # basket_discount – popust na celu korpu (fiksni iznos ili %)
+        basket_disc = effects.get("basket_discount")
+        if basket_disc and isinstance(basket_disc, dict):
+            amount   = basket_disc.get("amount")
+            fraction = basket_disc.get("fraction")
+            if amount and int(amount) > 0:
+                rsd = int(amount) // 100
+                fallback = primary_text or f"{rsd} RSD popust na korpu"
+                add(fallback, wolt_plus=is_wp)
+            elif fraction and float(fraction) > 0:
+                pct = int(round(float(fraction) * 100))
+                fallback = primary_text or f"{pct}% popust na celu korpu"
+                add(fallback, wolt_plus=is_wp)
+
+        # delivery_discount – popust na dostavu / besplatna dostava
+        delivery_disc = effects.get("delivery_discount")
+        if delivery_disc and isinstance(delivery_disc, dict):
+            amount   = delivery_disc.get("amount")
+            fraction = delivery_disc.get("fraction")
+            if (amount is not None and int(amount) == 0) or (fraction and float(fraction) >= 1.0):
+                fallback = primary_text or "Besplatna dostava"
+                add(fallback, wolt_plus=is_wp)
+            elif amount and int(amount) > 0:
+                rsd = int(amount) // 100
+                fallback = primary_text or f"{rsd} RSD popust na dostavu"
+                add(fallback, wolt_plus=is_wp)
+
+        # free_items – gratis artikli
+        free_items = effects.get("free_items")
+        if free_items and isinstance(free_items, (dict, list)):
+            fallback = primary_text or "Gratis artikal uz porudžbinu"
+            add(fallback, wolt_plus=is_wp)
+
+    # venue.banners – banneri prikazani na stranici restorana
+    venue = data.get("venue") or {}
+    for ban in venue.get("banners", []):
+        if not isinstance(ban, dict):
+            continue
+        is_wp = ban.get("show_wolt_plus", False)
+        disc = ban.get("discount") or {}
+        add(disc.get("formatted_text"), wolt_plus=is_wp)
+
+    # offer_trackers – progress bar tracker u UI-u
+    offer_assistant = venue.get("offer_assistant") or {}
+    for tracker in offer_assistant.get("offer_trackers", []):
+        if not isinstance(tracker, dict):
+            continue
+        is_wp = tracker.get("offer_type") == "wolt_plus" or tracker.get("show_wolt_plus", False)
+        add(tracker.get("title"), wolt_plus=is_wp)
+
+    return akcije
+
+def _parse_dynamic(data: dict) -> list:
+    akcije = set()
+    ignore_texts = {
+        "prikaži detalje", "show details", "vidi sve", "see all",
+        "detalji restorana", "restaurant details", "more", "još",
+        "schedule order", "naruči", "see menu", "add {amount} more",
+        "try for 30 days for free!", "get rsd0 delivery fee & more!",
+    }
+
+    def add(text, wolt_plus=False):
+        t = (text or "").strip()
+        if not t or len(t) <= 3 or t.lower() in ignore_texts:
+            return
+        prefix = "• [Wolt+] " if wolt_plus else "• "
+        akcije.add(f"{prefix}{t}")
+
+    venue_raw = data.get("venue_raw") or {}
+    for disc in venue_raw.get("discounts", []):
+        if not isinstance(disc, dict):
+            continue
+        is_wp = (disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False) or (disc.get("conditions") or {}).get("has_wolt_plus") == True)
+        banner = disc.get("banner") or {}
+        add(banner.get("formatted_text"), wolt_plus=is_wp)
+        desc = disc.get("description") or {}
+        add(desc.get("title"), wolt_plus=is_wp)
+
+    venue = data.get("venue") or {}
+    for banner in venue.get("banners", []):
+        if not isinstance(banner, dict):
+            continue
+        is_wp = banner.get("show_wolt_plus", False)
+        disc = banner.get("discount") or {}
+        add(disc.get("formatted_text"), wolt_plus=is_wp)
+
+    offer_assistant = venue.get("offer_assistant") or {}
+    for tracker in offer_assistant.get("offer_trackers", []):
+        if not isinstance(tracker, dict):
+            continue
+        is_wp = tracker.get("offer_type") == "wolt_plus" or tracker.get("show_wolt_plus", False)
+        add(tracker.get("title"), wolt_plus=is_wp)
+
+    return list(akcije)
+
+
+def _has_item_discounts(data: dict) -> bool:
+    for item in data.get("items", []):
+        price = (item.get("base_price") or item.get("price") or 0) / 100
+        orig = (
+            item.get("original_price") or
+            item.get("strikethrough_price") or
+            item.get("compare_at_price") or
+            item.get("unit_price") or 0
+        ) / 100
+        if orig > 0 and orig > price:
+            return True
+    return False
 
 # ─────────────────────────── FETCH GRAD ──────────────────────────────────────
 
@@ -342,38 +490,35 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                     est      = venue.get("estimate_range") or venue.get("estimate")
                     delivery = f"{est} min" if est else "-"
 
+                    feed_akcije = []
                     novo_status = "Ne"
                     for badge in venue.get("badges", []):
-                        if badge.get("text", "").lower() in ["novo", "new"] or badge.get("label", "").lower() in ["novo", "new"]:
+                        txt = badge.get("text", "")
+                        if txt:
+                            if txt.lower() in ["novo", "new"]:
+                                novo_status = "Da"
+                            else:
+                                feed_akcije.append(f"• {txt}")
+                    label = venue.get("label", "")
+                    if label:
+                        if label.lower() in ["novo", "new"]:
                             novo_status = "Da"
-
-                    # Koordinate restorana – koristimo ih za dynamic API
-                    # Wolt listing vraca location kao {"coordinates": [lon, lat]} (GeoJSON format)
-                    location = venue.get("location") or {}
-                    coords = location.get("coordinates")  # [lon, lat] u GeoJSON formatu!
-                    if coords and len(coords) >= 2:
-                        r_lon = float(coords[0])
-                        r_lat = float(coords[1])
-                    else:
-                        r_lat = float(location.get("lat") or location.get("latitude") or lat)
-                        r_lon = float(location.get("lon") or location.get("longitude") or lon)
+                        else:
+                            feed_akcije.append(f"• {label}")
 
                     restaurants[slug] = {
-                        "grad":           city_display,
-                        "naziv":          name,
-                        "slug":           slug,
-                        "status":         status_obj,
-                        "ocena":          str(r_score),
-                        "dostava":        delivery,
-                        "novo":           novo_status,
-                        "_feed_akcije":   [],
-                        "_feed_has_promo": False,
-                        "_lat":           r_lat,
-                        "_lon":           r_lon,
-                        "item_popusti":   "Ne",
-                        "akcije":         "-",
-                        "link":           f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
-                        "naziv_norm":     normalize(name),
+                        "grad":         city_display,
+                        "naziv":        name,
+                        "slug":         slug,
+                        "status":       status_obj,
+                        "ocena":        str(r_score),
+                        "dostava":      delivery,
+                        "novo":         novo_status,
+                        "_feed_akcije": feed_akcije,
+                        "item_popusti": "Ne",
+                        "akcije":       "-",
+                        "link":         f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
+                        "naziv_norm":   normalize(name),
                     }
 
         new_this_page = len(restaurants) - count_before
@@ -386,7 +531,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
             break  # nema više stranica
 
         skip += 40
-        time.sleep(0.05)
+        time.sleep(0.2)
 
     if not restaurants or stop_event.is_set():
         if not restaurants:
@@ -400,39 +545,38 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
 
     status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
 
-    sa_akcijama_count = 0
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _fetch_one,
+                slug,
+                lat,
+                lon,
+                restaurants[slug]["_feed_akcije"],
+                stop_event,
+            ): slug
+            for slug in slugs
+        }
 
-    for i, slug in enumerate(slugs):
-        if stop_event.is_set():
-            break
+        for future in as_completed(futures):
+            if stop_event.is_set():
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            try:
+                slug, akcije_str, item_pop = future.result()
+                restaurants[slug]["akcije"]       = akcije_str
+                restaurants[slug]["item_popusti"] = item_pop
+            except Exception:
+                pass
 
-        slug_out, akcije_str, item_pop, status_log = _fetch_one(
-            slug,
-            restaurants[slug]["_lat"],
-            restaurants[slug]["_lon"],
-            restaurants[slug]["_feed_akcije"],
-            stop_event,
-        )
-        restaurants[slug]["akcije"]       = akcije_str
-        restaurants[slug]["item_popusti"] = item_pop
-
-        if akcije_str != "-":
-            sa_akcijama_count += 1
-
-        completed = i + 1
-        if completed % 5 == 0 or completed == total:
-            status_placeholder.info(
-                f"⚡ **{city_display}**: {completed}/{total} | "
-                f"sa akcijama: {sa_akcijama_count} | {status_log}"
-            )
-
-        time.sleep(2)  # 2 sekunde između svakog restorana
-
+            completed += 1
+            if completed % 10 == 0 or completed == total:
+                status_placeholder.info(
+                    f"⚡ **{city_display}**: {completed}/{total} restorana obrađeno..."
+                )
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
-        r.pop("_lat", None)
-        r.pop("_lon", None)
 
     return list(restaurants.values())
 
@@ -607,14 +751,13 @@ def run_scheduled_scan_and_send():
 
     df["naziv_norm"] = df["naziv"].apply(normalize)
     merged = df.merge(
-        amm_df[["restaurant_norm", "restaurant_display", "am_name", "am_email"]],
+        amm_df[["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]],
         left_on="naziv_norm", right_on="restaurant_norm", how="inner"
     )
 
     def should_alert(row):
-        has_akcije       = str(row.get("akcije", "-")).strip() not in ("", "-")
-        has_item_popusti = str(row.get("item_popusti", "Ne")) == "Da"
-        return bool(has_akcije or has_item_popusti)
+        filtered = filter_akcije_for_email(row["akcije"])
+        return filtered != "-" or row.get("item_popusti") == "Da"
 
     merged["_alert"] = merged.apply(should_alert, axis=1)
     sa_akcijama = merged[merged["_alert"]].copy()
@@ -789,20 +932,12 @@ with tab_scan:
                     Path("_scan_status.txt").write_text("❌ " + str(msg))
                 def empty(self, *a, **k):
                     pass
-            try:
-                result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
-                if result is not None and not result.empty:
-                    result.to_csv("_scan_result.csv", index=False)
-                    Path("_scan_status.txt").write_text("✅ Sken završen!")
-                else:
-                    Path("_scan_status.txt").write_text("⚠️ Sken završen – nema restorana.")
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                Path("_scan_status.txt").write_text(f"❌ GREŠKA: {e}")
-                Path("_scan_error.txt").write_text(f"{e}\n\n{tb}")
-            finally:
-                Path("_scan_done.txt").write_text("1")
+            result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
+            # Čuvamo rezultat na disk – session_state nije dostupan iz threada
+            if result is not None and not result.empty:
+                result.to_csv("_scan_result.csv", index=False)
+            Path("_scan_done.txt").write_text("1")
+            Path("_scan_status.txt").write_text("✅ Sken završen!")
 
         bg = threading.Thread(target=_run_scan_bg, daemon=True)
         bg.start()
@@ -851,14 +986,7 @@ with tab_scan:
             if _stop_ev.is_set():
                 st.warning("⏹️ Scan je zaustavljen pre završetka.")
             else:
-                err_file = Path("_scan_error.txt")
-                if err_file.exists():
-                    err_txt = err_file.read_text()
-                    st.error(f"❌ Scan pukao sa greškom:")
-                    st.code(err_txt)
-                    err_file.unlink(missing_ok=True)
-                else:
-                    st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
+                st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
 
     df = st.session_state.df_wolt
     if not df.empty:
@@ -1132,14 +1260,15 @@ with tab_alert:
         amm_df["restaurant_norm"]     = amm_df["restaurant_norm"].apply(str)
 
         merged = df_wolt.merge(
-            amm_df[["restaurant_norm", "restaurant_display", "am_name", "am_email"]],
+            amm_df[["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]],
             left_on="naziv_norm", right_on="restaurant_norm", how="inner"
         )
 
         def should_alert(row):
-            has_akcije       = str(row.get("akcije", "-")).strip() not in ("", "-")
-            has_item_popusti = str(row.get("item_popusti", "Ne")) == "Da"
-            return bool(has_akcije or has_item_popusti)
+            filtered = filter_akcije_for_email(row["akcije"])
+            has_real_promo   = filtered != "-"
+            has_item_popusti = row.get("item_popusti") == "Da"
+            return has_real_promo or has_item_popusti
 
         merged["_alert"] = merged.apply(should_alert, axis=1)
         sa_akcijama = merged[merged["_alert"]].copy()
@@ -1428,7 +1557,7 @@ Cookie traje ~24h.
     st.markdown("---")
     st.markdown("#### ⚙️ Podešavanja fetcha")
     st.info(f"Trenutni broj paralelnih radnika: **{FETCH_WORKERS}**. "
-            "Ako dobijaš 429 greške, smanji `FETCH_WORKERS` u kodu (npr. na 40).")
+            "Ako dobijaš 429 greške, smanji `FETCH_WORKERS` u kodu (npr. na 5).")
 
     st.markdown("---")
     st.markdown("#### 🚫 Filtrirane akcije iz emaila")
@@ -1487,13 +1616,12 @@ Cookie traje ~24h.
         if dyn_data:
             with st.expander("Pun JSON (dynamic)", expanded=True):
                 st.json(dyn_data)
-            st.markdown("**Parsed akcije (full parser):**")
-            parsed, ima_item = _parse_dynamic(dyn_data)
+            st.markdown("**Parsed akcije:**")
+            parsed = _parse_dynamic(dyn_data)
             for p in parsed:
                 st.write(p)
             if not parsed:
                 st.warning("Nema parsiranih akcija.")
-            st.markdown(f"**Item discount u dynamic:** `{ima_item}`")
         else:
             st.warning(f"Dynamic endpoint nije vratio podatke. HTTP status: {dyn_status}")
 
