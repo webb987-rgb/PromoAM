@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 100
+FETCH_WORKERS = 10
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -197,11 +197,15 @@ def make_thread_session() -> requests.Session:
     s = requests.Session()
     for k, v in session.headers.items():
         s.headers[k] = v
-    cookie_val = st.session_state.get("wolt_cookie", "")
+    # Čitamo cookie iz fajla jer session_state nije dostupan iz background threada
+    try:
+        cookie_val = Path("_scan_cookie.txt").read_text().strip()
+    except Exception:
+        cookie_val = ""
+    if not cookie_val:
+        cookie_val = WOLT_COOKIE or ""
     if cookie_val:
         s.headers["Cookie"] = cookie_val
-    elif WOLT_COOKIE:
-        s.headers["Cookie"] = WOLT_COOKIE
     return s
 
 # ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
@@ -919,6 +923,10 @@ with tab_scan:
         Path("_scan_done.txt").unlink(missing_ok=True)
         Path("_scan_result.csv").unlink(missing_ok=True)
         Path("_scan_status.txt").write_text("🔄 Priprema skena...")
+
+        # Capture cookie u glavnom threadu i sačuvaj u fajl da thread može da ga čita
+        _cookie_snap = st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or ""
+        Path("_scan_cookie.txt").write_text(_cookie_snap)
 
         def _run_scan_bg():
             class LivePH:
