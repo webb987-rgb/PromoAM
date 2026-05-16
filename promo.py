@@ -210,6 +210,53 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
 
     return list(akcije)
 
+def fetch_menu_discounts(slug: str) -> dict:
+    """
+    Proverava meni restorana i vraca:
+    {
+      "has_discounts": True/False,
+      "items": [{"name": "...", "price": 803, "original_price": 879}, ...]
+    }
+    Koristi assortment endpoint (isti kao Menu Scraper skripta).
+    """
+    url = f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
+    thread_session = requests.Session()
+    thread_session.headers.update(dict(session.headers))
+
+    try:
+        r = thread_session.get(url, timeout=15)
+        if r.status_code != 200:
+            return {"has_discounts": False, "items": []}
+        data = r.json()
+    except Exception:
+        return {"has_discounts": False, "items": []}
+
+    discounted = []
+    for item in data.get("items", []):
+        # Cene su u "coins" (centima) - delimo sa 100
+        price = (item.get("base_price") or item.get("price") or 0) / 100
+        # Originalna (precrtan) cena - moguca polja
+        orig = (
+            item.get("original_price") or
+            item.get("strikethrough_price") or
+            item.get("compare_at_price") or
+            item.get("unit_price") or
+            0
+        ) / 100
+
+        if orig > 0 and orig > price:
+            discounted.append({
+                "name": item.get("name", ""),
+                "price": int(price),
+                "original_price": int(orig),
+                "discount_pct": round((1 - price / orig) * 100),
+            })
+
+    return {
+        "has_discounts": len(discounted) > 0,
+        "items": discounted,
+    }
+
 def fetch_city(city: str, status_placeholder) -> list[dict]:
     city_slug = CITY_SLUG_MAP.get(city, normalize(city).replace(" ", "-"))
     lat, lon  = CITY_COORDS.get(city, (44.8178, 20.4569))
@@ -281,7 +328,8 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
                         "ocena":      str(rating_score),
                         "dostava":    delivery_time,
                         "novo":       novo_status,
-                        "akcije_feed": akcije_lista,  # Čuvamo ovo za kasnije spajanje
+                        "akcije_feed": akcije_lista,
+                        "item_popusti": "Ne",  # popunjava se u drugom prolazu
                         "link":       f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm": normalize(name),
                     }
@@ -345,8 +393,30 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
             time.sleep(BATCH_PAUSE)
 
     progress_bar.empty()
-    
-    # Brisanje pomoćnog ključa pre nego što ga vratimo
+
+    # 3. Brza provera item-level popusta (precrtan cene na proizvodima)
+    progress_bar2 = st.progress(0, text=f"🏷️ Proveravam popuste na proizvodima za {city}...")
+    completed2 = 0
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch_slugs = slugs[batch_start:batch_start + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
+            futures2 = {pool.submit(fetch_menu_discounts, slug): slug for slug in batch_slugs}
+            for fut in as_completed(futures2):
+                slug = futures2[fut]
+                try:
+                    result = fut.result()
+                    restaurants[slug]["item_popusti"] = "Da" if result["has_discounts"] else "Ne"
+                    restaurants[slug]["_menu_items"] = result["items"]  # cuvamo za dugme
+                except Exception:
+                    restaurants[slug]["item_popusti"] = "Ne"
+                    restaurants[slug]["_menu_items"] = []
+                completed2 += 1
+        progress_bar2.progress(completed2 / total, text=f"🏷️ Proveravam popuste... ({completed2}/{total})")
+        if batch_start + BATCH_SIZE < total:
+            time.sleep(BATCH_PAUSE)
+    progress_bar2.empty()
+
+    # Brisanje pomoćnih ključeva pre nego što ga vratimo
     for r in restaurants.values():
         r.pop("akcije_feed", None)
 
@@ -549,26 +619,72 @@ with tab_scan:
 
         st.caption(f"Prikazano: **{len(fdf)}** restorana")
 
-        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "akcije", "link"]
+        # Filter po item popustima
+        fi1, fi2 = st.columns(2)
+        with fi1:
+            samo_item_popusti = st.checkbox("🏷️ Samo sa popustima na proizvodima", value=False, key="scan_item_pop")
+        if samo_item_popusti and "item_popusti" in fdf.columns:
+            fdf = fdf[fdf["item_popusti"] == "Da"]
+
+        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "item_popusti", "akcije", "link"]
+        display_cols = [c for c in display_cols if c in fdf.columns]
+
         st.dataframe(
             fdf[display_cols].reset_index(drop=True),
             use_container_width=True,
             hide_index=True,
-            height=520,
+            height=480,
             column_config={
-                "grad":    st.column_config.TextColumn("Grad"),
-                "naziv":   st.column_config.TextColumn("Restoran"),
-                "status":  st.column_config.TextColumn("Status"),
-                "ocena":   st.column_config.TextColumn("Ocena"),
-                "dostava": st.column_config.TextColumn("Dostava"),
-                "novo":    st.column_config.TextColumn("Novi"),
-                "akcije":  st.column_config.TextColumn("Akcije", width="large"),
-                "link":    st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
+                "grad":         st.column_config.TextColumn("Grad"),
+                "naziv":        st.column_config.TextColumn("Restoran"),
+                "status":       st.column_config.TextColumn("Status"),
+                "ocena":        st.column_config.TextColumn("Ocena"),
+                "dostava":      st.column_config.TextColumn("Dostava"),
+                "novo":         st.column_config.TextColumn("Novi"),
+                "item_popusti": st.column_config.TextColumn("🏷️ Item popusti"),
+                "akcije":       st.column_config.TextColumn("Akcije", width="large"),
+                "link":         st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
             },
         )
 
         csv = fdf[display_cols].to_csv(index=False).encode("utf-8")
         st.download_button("📥 Preuzmi CSV", csv, "wolt_scan.csv", "text/csv")
+
+        # ── Detaljan pregled popusta po proizvodu ──
+        st.markdown("---")
+        st.markdown("#### 🏷️ Detaljni popusti na proizvodima")
+        slug_options = {}
+        if "item_popusti" in fdf.columns:
+            sa_pop = fdf[fdf["item_popusti"] == "Da"]
+            if not sa_pop.empty:
+                slug_options = dict(zip(sa_pop["naziv"], sa_pop["slug"]))
+
+        if slug_options:
+            sel_naziv = st.selectbox(
+                "Izaberi restoran za detaljan pregled:",
+                ["-- Izaberi --"] + list(slug_options.keys()),
+                key="detail_rest_sel"
+            )
+            if st.button("🔍 Skeniraj meni", key="btn_skeniraj") and sel_naziv != "-- Izaberi --":
+                sel_slug = slug_options[sel_naziv]
+                # Prvo provjeri _menu_items iz scan-a
+                cached = df[df["slug"] == sel_slug]["_menu_items"].values if "_menu_items" in df.columns else []
+                if len(cached) > 0 and cached[0]:
+                    menu_items = cached[0]
+                else:
+                    with st.spinner("Učitavam meni..."):
+                        result = fetch_menu_discounts(sel_slug)
+                        menu_items = result["items"]
+
+                if menu_items:
+                    st.success(f"Pronađeno **{len(menu_items)}** proizvoda sa popustom:")
+                    menu_df = pd.DataFrame(menu_items)
+                    menu_df.columns = ["Naziv", "Cena (RSD)", "Originalna cena (RSD)", "Popust %"]
+                    st.dataframe(menu_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Nema proizvoda sa precrtanim cenama u meniju.")
+        else:
+            st.info("Pokreni scan da bi se ovde prikazali restorani sa item popustima.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: AMM BAZA
