@@ -915,6 +915,9 @@ with tab_scan:
         _cities_snap = list(selected_cities)
         _stop_ev_snap = st.session_state.scan_stop_event
 
+        # Očisti stare fajlove pre novog skena
+        Path("_scan_done.txt").unlink(missing_ok=True)
+        Path("_scan_result.csv").unlink(missing_ok=True)
         Path("_scan_status.txt").write_text("🔄 Priprema skena...")
 
         def _run_scan_bg():
@@ -930,16 +933,20 @@ with tab_scan:
                 def empty(self, *a, **k):
                     pass
             result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
-            st.session_state["_scan_result"] = result
-            st.session_state["_scan_done"] = True
-            st.session_state.scan_running = False
+            # Čuvamo rezultat na disk – session_state nije dostupan iz threada
+            if result is not None and not result.empty:
+                result.to_csv("_scan_result.csv", index=False)
+            Path("_scan_done.txt").write_text("1")
+            Path("_scan_status.txt").write_text("✅ Sken završen!")
 
         bg = threading.Thread(target=_run_scan_bg, daemon=True)
         bg.start()
         st.rerun()
 
     # Prikaz statusa dok scan traje
-    if st.session_state.scan_running:
+    scan_done_flag = Path("_scan_done.txt").exists()
+
+    if st.session_state.scan_running and not scan_done_flag:
         elapsed = time.time() - (st.session_state.scan_start_time or time.time())
         m2, s2 = divmod(int(elapsed), 60)
         try:
@@ -951,11 +958,17 @@ with tab_scan:
         st.rerun()
 
     # Prikaz rezultata kad scan završi
-    if st.session_state.get("_scan_done"):
-        df_result = st.session_state.get("_scan_result")
+    if st.session_state.scan_running and scan_done_flag:
+        Path("_scan_done.txt").unlink(missing_ok=True)
+        st.session_state.scan_running = False
         scan_duration = time.time() - (st.session_state.scan_start_time or time.time())
-        st.session_state["_scan_done"] = False
         _stop_ev = st.session_state.scan_stop_event
+
+        try:
+            df_result = pd.read_csv("_scan_result.csv")
+        except Exception:
+            df_result = pd.DataFrame()
+
         if df_result is not None and not df_result.empty:
             st.session_state.df_wolt = df_result
             st.session_state.last_scan = local_now()
@@ -968,6 +981,7 @@ with tab_scan:
                 f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama, "
                 f"**{sa_item}** sa item popustima."
             )
+            st.rerun()
         else:
             if _stop_ev.is_set():
                 st.warning("⏹️ Scan je zaustavljen pre završetka.")
