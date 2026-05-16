@@ -44,7 +44,7 @@ ALERT_FILE = Path("alert_log.csv")
 ALERT_COLS = ["timestamp", "city", "restaurant_display", "am_name", "am_email", "akcije"]
 
 # Fajl u kome čuvamo rezultate poslednjeg skena – permanentna baza
-SCAN_FILE  = Path("scan_baza_item.csv")
+SCAN_FILE  = Path("scan_baza_item.json")
 
 # ─────────────────────────── PAGE CONFIG ─────────────────────────────────────
 
@@ -99,14 +99,14 @@ def filter_akcije_for_email(akcije_str: str) -> str:
 # ─────────────────────────── PERMANENTNA BAZA SKENA ─────────────────────────
 
 def save_scan(df: pd.DataFrame):
-    """Čuva rezultate skena u CSV fajl (permanentna baza)."""
-    df.to_csv(SCAN_FILE, index=False)
+    """Čuva rezultate skena u JSON fajl (permanentna baza)."""
+    df.to_json(SCAN_FILE, orient="records", force_ascii=False)
 
 def load_scan() -> pd.DataFrame:
-    """Učitava prethodni sken iz CSV fajla."""
+    """Učitava prethodni sken iz JSON fajla."""
     if SCAN_FILE.exists():
         try:
-            df = pd.read_csv(SCAN_FILE)
+            df = pd.read_json(SCAN_FILE, orient="records")
             return df
         except Exception:
             return pd.DataFrame()
@@ -943,7 +943,7 @@ with tab_scan:
             result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
             # Čuvamo rezultat na disk – session_state nije dostupan iz threada
             if result is not None and not result.empty:
-                result.to_csv("_scan_result.csv", index=False)
+                result.to_json("_scan_result.json", orient="records", force_ascii=False)
             Path("_scan_done.txt").write_text("1")
             Path("_scan_status.txt").write_text("✅ Sken završen!")
 
@@ -973,7 +973,7 @@ with tab_scan:
         _stop_ev = st.session_state.scan_stop_event
 
         try:
-            df_result = pd.read_csv("_scan_result.csv")
+            df_result = pd.read_json("_scan_result.json", orient="records")
         except Exception:
             df_result = pd.DataFrame()
 
