@@ -25,8 +25,9 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 8          # Manji broj threadova → manje 429
-FETCH_DELAY   = 0.3       # Pauza između svakog fetch-a po threadu (sekunde)
+FETCH_WORKERS = 3          # Broj paralelnih threadova
+FETCH_DELAY   = 0.8       # Pauza između svakog fetch-a (sekunde)
+SUBMIT_DELAY  = 0.25      # Pauza između submitovanja taskova u executor (staggered start)
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -243,23 +244,17 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
     """
     Fetches a single URL sa retry logikom.
     Vraća (response_json_or_None, status_code).
-    Globalni throttle se primjenjuje pri svakom pokušaju.
 
-    Strategija:
-    - Per-request delay (FETCH_DELAY) sprečava burst pre nego što dođe 429
-    - 429 throttle je kraći (1.5s * 2^attempt): 1.5s, 3s, 6s
-    - Jitter ±0.2s sprečava thundering herd (svi threadovi ne kreću istovremeno)
+    Staggered start se kontroliše na nivou submitovanja (SUBMIT_DELAY),
+    a FETCH_DELAY dodaje pauzu između pokušaja unutar jednog threada.
     """
-    import random
-
-    # Mali per-request delay sa jitterom – ključno za prevenciju 429
-    jitter = random.uniform(-0.2, 0.2)
-    time.sleep(max(0, FETCH_DELAY + jitter))
-
     for attempt in range(4):
         if stop_event.is_set():
             return None, 0
         _wait_throttle()
+        if attempt > 0:
+            # Između retry-jeva čekamo FETCH_DELAY (ne na prvom pokušaju – to je submit delay)
+            time.sleep(FETCH_DELAY)
         try:
             r = ts.get(url, timeout=10)
             if r.status_code == 200:
@@ -268,8 +263,7 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
                 _log_fetch(f"{label} → {r.status_code} (auth fail)")
                 return None, r.status_code
             if r.status_code == 429:
-                # Kraći throttle: 1.5s, 3s, 6s (umesto 3s, 5s, 9s)
-                wait = 1.5 * (2 ** attempt)
+                wait = 2.0 * (2 ** attempt)   # 2s, 4s, 8s, 16s
                 _set_throttle(wait)
                 _log_fetch(f"{label} → 429 retry {attempt} (throttle {wait:.1f}s)")
                 continue
@@ -584,17 +578,23 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
-        futures = {
-            executor.submit(
+        # ── Rate-limited submit: taskovi se submituju sa SUBMIT_DELAY pauzom ──
+        # Ovo sprečava thundering herd (svi threadovi ne kreću odjednom).
+        # Npr. FETCH_WORKERS=3, SUBMIT_DELAY=0.25s → ~4 req/s max burst
+        futures = {}
+        for slug in slugs:
+            if stop_event.is_set():
+                break
+            fut = executor.submit(
                 _fetch_one,
                 slug,
                 lat,
                 lon,
                 restaurants[slug]["_feed_akcije"],
                 stop_event,
-            ): slug
-            for slug in slugs
-        }
+            )
+            futures[fut] = slug
+            time.sleep(SUBMIT_DELAY)  # staggered start
 
         for future in as_completed(futures):
             if stop_event.is_set():
@@ -1587,9 +1587,9 @@ Cookie traje ~24h.
     st.markdown("---")
     st.markdown("#### ⚙️ Podešavanja fetcha")
     st.info(f"Trenutni broj paralelnih radnika: **{FETCH_WORKERS}**, "
-            f"delay po requestu: **{FETCH_DELAY}s** (±0.2s jitter). "
-            "Ako dobijaš 429 greške, poveći `FETCH_DELAY` u kodu (npr. 0.6). "
-            "Ako je previše sporo, smanji ga (min 0.2) ili poveći `FETCH_WORKERS` (max 8).")
+            f"submit delay: **{SUBMIT_DELAY}s**, fetch delay između retry-jeva: **{FETCH_DELAY}s**. "
+            "Ako i dalje dobijaš 429 → poveći `SUBMIT_DELAY` (npr. 0.35). "
+            "Ako je previše sporo → smanji `SUBMIT_DELAY` (min 0.15) ili poveći `FETCH_WORKERS` na 4.")
 
     st.markdown("---")
     st.markdown("#### 🚫 Filtrirane akcije iz emaila")
