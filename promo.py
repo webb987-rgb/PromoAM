@@ -141,15 +141,13 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
     thread_session = requests.Session()
     thread_session.headers.update(dict(session.headers))
 
-    # Retry do 3 puta ako dobijemo prazan odgovor (soft rate-limit)
     data = None
-    for attempt in range(3):
+    for attempt in range(2):  # max 2 pokusaja, retry se radi na visem nivou
         try:
             r = thread_session.get(url, timeout=15)
             if r.status_code != 200:
                 return []
             data = r.json()
-            # Proveravamo da li ima stvarnih podataka
             venue_raw = data.get("venue_raw") or {}
             venue = data.get("venue") or {}
             has_data = (
@@ -158,13 +156,12 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
                 bool((venue.get("offer_assistant") or {}).get("offer_trackers"))
             )
             if has_data:
-                break  # Dobili smo podatke, izlazimo
-            # Prazan odgovor - cekamo pre retry-a
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-        except Exception:
-            if attempt < 2:
+                break
+            if attempt == 0:
                 time.sleep(1.0)
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
     if not data:
         return []
 
@@ -360,36 +357,32 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
     progress_text = f"🎯 Učitavam detaljne akcije za {city}..."
     progress_bar = st.progress(0, text=progress_text)
     
-    # Batch paralelizam: BATCH_SIZE threadova simultano, pauza između batch-eva
-    # 1600 / 5 * 0.8s = ~256s (~4 min) - dovoljno sporo da ne trigguje rate-limit
-    BATCH_SIZE = 3
-    BATCH_PAUSE = 1.2  # sekunde između batch-eva
-
+    # Sekvencijalno sa retry - jedini nacin da pouzdano izvucemo sve akcije
+    # Wolt rate-limituje paralelne zahteve, sekvencijalno je jedino sigurno
     completed = 0
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch_slugs = slugs[batch_start:batch_start + BATCH_SIZE]
+    failed_slugs = []  # slugovi koji nisu dali podatke, pokusavamo ponovo na kraju
 
-        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
-            futures = {pool.submit(fetch_dynamic_discounts, slug, lat, lon): slug
-                       for slug in batch_slugs}
-            for fut in as_completed(futures):
-                slug = futures[fut]
-                try:
-                    dynamic_akcije = fut.result()
-                except Exception:
-                    dynamic_akcije = []
+    for slug in slugs:
+        dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
+        if not dynamic_akcije:
+            failed_slugs.append(slug)
+        sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
+        restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
+        completed += 1
+        if completed % 10 == 0 or completed == total:
+            progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
+        time.sleep(0.2)
 
+    # Retry za failed slugove - cekamo malo pa pokusamo ponovo
+    if failed_slugs:
+        progress_bar.progress(1.0, text=f"🔄 Retry za {len(failed_slugs)} restorana...")
+        time.sleep(3)  # duza pauza pre retry-a
+        for slug in failed_slugs:
+            dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
+            if dynamic_akcije:
                 sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
                 restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
-
-                completed += 1
-
-        progress_bar.progress(
-            completed / total,
-            text=f"{progress_text} ({completed}/{total})"
-        )
-        if batch_start + BATCH_SIZE < total:
-            time.sleep(BATCH_PAUSE)
+            time.sleep(0.3)
 
     progress_bar.empty()
 
