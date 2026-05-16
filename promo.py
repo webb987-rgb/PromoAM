@@ -412,9 +412,14 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
 def scan_all_cities(selected_cities: list[str], status_placeholder) -> pd.DataFrame:
     all_rows = []
     for i, city in enumerate(selected_cities):
-        rows = fetch_city(city, status_placeholder)
-        all_rows.extend(rows)
-        status_placeholder.success(f"✅ {city} završen!")
+        try:
+            rows = fetch_city(city, status_placeholder)
+            all_rows.extend(rows)
+            status_placeholder.success(f"✅ {city} završen! ({len(rows)} restorana)")
+        except Exception as e:
+            status_placeholder.error(f"❌ Greška za {city}: {e}")
+            import traceback
+            st.error(traceback.format_exc())
         if i < len(selected_cities) - 1:
             time.sleep(1)
     status_placeholder.empty()
@@ -575,6 +580,12 @@ with tab_scan:
         with fc4:
             search = st.text_input("🔎 Pretraži naziv:", key="scan_search")
 
+        fc5, fc6 = st.columns(2)
+        with fc5:
+            samo_item_pop = st.checkbox("🏷️ Samo sa item popustima", value=False, key="scan_item_pop")
+        with fc6:
+            samo_wolt_plus = st.checkbox("💙 Samo sa Wolt+ akcijama", value=False, key="scan_wolt_plus")
+
         # Filter po tipu akcije
         sve_akcije_tekst = sorted(set(
             line.lstrip("• ").strip()
@@ -591,6 +602,7 @@ with tab_scan:
             key="scan_akcija_filter"
         )
 
+        # Primeni sve filtere
         fdf = df[df["grad"].isin(grad_filter)]
         if samo_akcije:
             fdf = fdf[fdf["akcije"] != "-"]
@@ -603,19 +615,35 @@ with tab_scan:
                 lambda cell: any(a in cell for a in akcija_filter) if cell != "-" else False
             )
             fdf = fdf[mask]
-
-        fc_extra1, fc_extra2 = st.columns(2)
-        with fc_extra1:
-            samo_item_pop = st.checkbox("🏷️ Samo sa item popustima", value=False, key="scan_item_pop")
-        with fc_extra2:
-            samo_wolt_plus = st.checkbox("💙 Samo sa Wolt+ akcijama", value=False, key="scan_wolt_plus")
-
         if samo_item_pop and "item_popusti" in fdf.columns:
             fdf = fdf[fdf["item_popusti"] == "Da"]
         if samo_wolt_plus:
             fdf = fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)]
 
-        st.caption(f"Prikazano: **{len(fdf)}** restorana")
+        # ── Dinamički brojač po aktivnim filterima ──
+        total_fdf    = len(fdf)
+        sa_ak        = len(fdf[fdf["akcije"] != "-"])
+        sa_item      = len(fdf[fdf["item_popusti"] == "Da"]) if "item_popusti" in fdf.columns else 0
+        sa_wplus     = len(fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)])
+        sa_novi_f    = len(fdf[fdf["novo"] == "Da"])
+        sa_otv       = len(fdf[fdf["status"] == "Otvoren"])
+
+        cnt1, cnt2, cnt3, cnt4, cnt5, cnt6 = st.columns(6)
+        for col, val, lbl, color in [
+            (cnt1, total_fdf, "Prikazano",        "#009de0"),
+            (cnt2, sa_ak,     "Sa akcijama",      "#27ae60"),
+            (cnt3, sa_item,   "Item popusti",     "#e67e22"),
+            (cnt4, sa_wplus,  "Wolt+",            "#8e44ad"),
+            (cnt5, sa_novi_f, "Novi",             "#e74c3c"),
+            (cnt6, sa_otv,    "Otvoreni",         "#2ecc71"),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div class='kpi' style='padding:10px 8px;border-top:3px solid {color}'>
+                  <div class='kpi-val' style='font-size:1.6rem;color:{color}'>{val}</div>
+                  <div class='kpi-lbl'>{lbl}</div>
+                </div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
         display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "item_popusti", "akcije", "link"]
         display_cols = [c for c in display_cols if c in fdf.columns]
