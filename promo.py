@@ -347,6 +347,11 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                         if badge.get("text", "").lower() in ["novo", "new"] or badge.get("label", "").lower() in ["novo", "new"]:
                             novo_status = "Da"
 
+                    # Koordinate restorana – koristimo ih za dynamic API
+                    location = venue.get("location") or {}
+                    r_lat = location.get("lat") or location.get("latitude") or lat
+                    r_lon = location.get("lon") or location.get("longitude") or lon
+
                     restaurants[slug] = {
                         "grad":           city_display,
                         "naziv":          name,
@@ -357,6 +362,8 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                         "novo":           novo_status,
                         "_feed_akcije":   [],
                         "_feed_has_promo": False,
+                        "_lat":           r_lat,
+                        "_lon":           r_lon,
                         "item_popusti":   "Ne",
                         "akcije":         "-",
                         "link":           f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
@@ -395,8 +402,8 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
             executor.submit(
                 _fetch_one,
                 slug,
-                lat,
-                lon,
+                restaurants[slug]["_lat"],
+                restaurants[slug]["_lon"],
                 restaurants[slug]["_feed_akcije"],
                 stop_event,
             ): slug
@@ -434,6 +441,8 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
+        r.pop("_lat", None)
+        r.pop("_lon", None)
 
     return list(restaurants.values())
 
