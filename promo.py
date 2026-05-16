@@ -25,8 +25,8 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 5          # Manji broj threadova → manje 429
-FETCH_DELAY   = 0.4       # Pauza između svakog fetch-a po threadu (sekunde)
+FETCH_WORKERS = 8          # Manji broj threadova → manje 429
+FETCH_DELAY   = 0.3       # Pauza između svakog fetch-a po threadu (sekunde)
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
