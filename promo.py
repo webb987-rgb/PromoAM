@@ -27,15 +27,7 @@ CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
 FETCH_WORKERS = 60   # povećano sa 10 → 60 (6x brže); ako dobijaš 429, smanji na 40
 
-EMAIL_IGNORE_PROMOS = [
-    # Samo masovne delivery fee akcije koje imaju maltene svi restorani
-    "0 din delivery fee for 14 days",
-    "0 din delivery fee",
-    "free delivery for 14 days",
-    "besplatna dostava 14 dana",
-    "besplatna dostava",
-    # NE filtriramo: item popuste, basket popuste, % popuste – to su prave akcije
-]
+EMAIL_IGNORE_PROMOS = []  # Nema filtera – prikazujemo SVE akcije
 
 AMM_FILE   = Path("amm_baza.csv")
 AMM_COLS   = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
@@ -90,11 +82,11 @@ def is_ignored_promo(text: str) -> bool:
     return False
 
 def filter_akcije_for_email(akcije_str: str) -> str:
+    """Vraća sve akcije bez ikakvog filtera."""
     if not akcije_str or akcije_str == "-":
         return "-"
     lines = [l for l in akcije_str.split("\n") if l.strip()]
-    filtered = [l for l in lines if not is_ignored_promo(l)]
-    return "\n".join(filtered) if filtered else "-"
+    return "\n".join(lines) if lines else "-"
 
 # ─────────────────────────── PERMANENTNA BAZA SKENA ─────────────────────────
 
@@ -867,8 +859,9 @@ def run_scheduled_scan_and_send():
     )
 
     def should_alert(row):
-        filtered = filter_akcije_for_email(row["akcije"])
-        return bool(filtered != "-" or str(row.get("item_popusti", "Ne")) == "Da")
+        has_akcije       = str(row.get("akcije", "-")).strip() not in ("", "-")
+        has_item_popusti = str(row.get("item_popusti", "Ne")) == "Da"
+        return bool(has_akcije or has_item_popusti)
 
     merged["_alert"] = merged.apply(should_alert, axis=1)
     sa_akcijama = merged[merged["_alert"]].copy()
@@ -1376,10 +1369,9 @@ with tab_alert:
         )
 
         def should_alert(row):
-            filtered = filter_akcije_for_email(row["akcije"])
-            has_real_promo   = filtered != "-"
+            has_akcije       = str(row.get("akcije", "-")).strip() not in ("", "-")
             has_item_popusti = str(row.get("item_popusti", "Ne")) == "Da"
-            return bool(has_real_promo or has_item_popusti)
+            return bool(has_akcije or has_item_popusti)
 
         merged["_alert"] = merged.apply(should_alert, axis=1)
         sa_akcijama = merged[merged["_alert"]].copy()
