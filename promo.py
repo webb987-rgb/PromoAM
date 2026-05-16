@@ -541,9 +541,9 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     # ── Paralelno fetchovanje akcija ──────────────────────────────────────────
     slugs = list(restaurants.keys())
     total = len(slugs)
-    progress_text = f"⚡ Učitavam akcije za {city_display} ({total} restorana)..."
-    progress_bar = st.progress(0, text=progress_text)
     completed = 0
+
+    status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
         futures = {
@@ -570,13 +570,10 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 pass
 
             completed += 1
-            if completed % 5 == 0 or completed == total:
-                progress_bar.progress(
-                    min(completed / total, 1.0),
-                    text=f"⚡ {city_display}: {completed}/{total} restorana obrađeno..."
+            if completed % 10 == 0 or completed == total:
+                status_placeholder.info(
+                    f"⚡ **{city_display}**: {completed}/{total} restorana obrađeno..."
                 )
-
-    progress_bar.empty()
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
