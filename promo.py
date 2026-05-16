@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 6
+FETCH_WORKERS = 10
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -268,48 +268,19 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
                 time.sleep(0.5)
     return None, -1
 
-def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str, str]:
+def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
     if stop_event.is_set():
-        return slug, "-", "Ne"
+        return slug, "-"
 
     ts = make_thread_session()
 
-    # ── Oba poziva PARALELNO unutar jednog thread-a ───────────────────────────
-    ass_url = f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
 
-    ass_result = [None]
-    dyn_result = [None]
-
-    def fetch_ass():
-        ass_result[0] = _fetch_url(ts, ass_url, f"ASS {slug}", stop_event)
-
-    def fetch_dyn():
-        dyn_result[0] = _fetch_url(ts, dyn_url, f"DYN {slug}", stop_event)
-
-    t_ass = threading.Thread(target=fetch_ass, daemon=True)
-    t_dyn = threading.Thread(target=fetch_dyn, daemon=True)
-    t_ass.start()
-    t_dyn.start()
-    t_ass.join()
-    t_dyn.join()
-
-    # ── Assortment rezultat ───────────────────────────────────────────────────
-    item_popusti = "Ne"
-    ass_data, _ = ass_result[0] or (None, 0)
-    if ass_data:
-        try:
-            if _has_item_discounts(ass_data):
-                item_popusti = "Da"
-        except Exception as e:
-            _log_fetch(f"ASS {slug} → parse EXC {e}")
-
-    # ── Dynamic rezultat ──────────────────────────────────────────────────────
     akcije_str = "-"
-    dyn_data, _ = dyn_result[0] or (None, 0)
+    dyn_data, _ = _fetch_url(ts, dyn_url, f"DYN {slug}", stop_event)
     if dyn_data:
         try:
             parsed   = _parse_dynamic_with_item_discount(dyn_data)
@@ -323,7 +294,7 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
         akcije_str = "\n".join(feed_akcije)
         _log_fetch(f"DYN {slug} → fallback na feed_akcije")
 
-    return slug, akcije_str, item_popusti
+    return slug, akcije_str
 
 
 def _parse_dynamic_with_item_discount(data: dict) -> list:
@@ -569,7 +540,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                         "dostava":      delivery,
                         "novo":         novo_status,
                         "_feed_akcije": feed_akcije,
-                        "item_popusti": "Ne",
+                        
                         "akcije":       "-",
                         "link":         f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm":   normalize(name),
@@ -617,9 +588,8 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
             try:
-                slug, akcije_str, item_pop = future.result()
-                restaurants[slug]["akcije"]       = akcije_str
-                restaurants[slug]["item_popusti"] = item_pop
+                slug, akcije_str = future.result()
+                restaurants[slug]["akcije"] = akcije_str
             except Exception:
                 pass
 
@@ -670,13 +640,6 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
 
             # Item popust badge ide U kolonu Akcije, ne uz naziv
             item_badge = ""
-            if a.get("item_popusti") == "Da":
-                item_badge = (
-                    "<div style='margin-top:6px'>"
-                    "<span style='background:#fff3cd;color:#856404;padding:2px 8px;"
-                    "border-radius:12px;font-size:11px;font-weight:700'>🏷️ ITEM POPUSTI</span>"
-                    "</div>"
-                )
 
             # Akcije tekst
             if akcije_filtered != "-":
@@ -811,7 +774,7 @@ def run_scheduled_scan_and_send():
 
     def should_alert(row):
         filtered = filter_akcije_for_email(row["akcije"])
-        return filtered != "-" or row.get("item_popusti") == "Da"
+        return filtered != "-"
 
     merged["_alert"] = merged.apply(should_alert, axis=1)
     sa_akcijama = merged[merged["_alert"]].copy()
@@ -823,7 +786,7 @@ def run_scheduled_scan_and_send():
                 "naziv":        row["naziv"],
                 "grad":         row["grad"],
                 "akcije":       row["akcije"],
-                "item_popusti": row.get("item_popusti", "Ne"),
+
                 "link":         row.get("link", ""),
             }
             for _, row in grp.iterrows()
@@ -1032,7 +995,7 @@ with tab_scan:
             st.session_state.last_scan = local_now()
             save_scan(df_result)
             m, s = divmod(int(scan_duration), 60)
-            sa_item = len(df_result[df_result["item_popusti"] == "Da"]) if "item_popusti" in df_result.columns else 0
+            sa_item = 0
             st.success(
                 f"✅ Scan završen za **{m:02d}:{s:02d}**! "
                 f"Pronađeno **{len(df_result)}** restorana, "
@@ -1053,8 +1016,8 @@ with tab_scan:
         k1, k2, k3, k4, k5 = st.columns(5)
         total        = len(df)
         sa_akcijama  = len(df[df["akcije"] != "-"])
-        sa_item_kpi  = len(df[df["item_popusti"] == "Da"]) if "item_popusti" in df.columns else 0
-        bilo_sta     = len(df[(df["akcije"] != "-") | (df.get("item_popusti", pd.Series(dtype=str)) == "Da")])
+        sa_item_kpi  = 0
+        bilo_sta     = len(df[df["akcije"] != "-"])
         otvoreni     = len(df[df["status"] == "Otvoren"])
         novi         = len(df[df["novo"] == "Da"])
 
@@ -1117,14 +1080,12 @@ with tab_scan:
                 lambda cell: any(a in cell for a in akcija_filter) if cell != "-" else False
             )
             fdf = fdf[mask]
-        if samo_item_pop and "item_popusti" in fdf.columns:
-            fdf = fdf[fdf["item_popusti"] == "Da"]
         if samo_wolt_plus:
             fdf = fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)]
 
         total_fdf = len(fdf)
         sa_ak     = len(fdf[fdf["akcije"] != "-"])
-        sa_item   = len(fdf[fdf["item_popusti"] == "Da"]) if "item_popusti" in fdf.columns else 0
+        sa_item   = 0
         sa_wplus  = len(fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)])
         sa_novi_f = len(fdf[fdf["novo"] == "Da"])
         sa_otv    = len(fdf[fdf["status"] == "Otvoren"])
@@ -1146,7 +1107,7 @@ with tab_scan:
                 </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
-        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "item_popusti", "akcije", "link"]
+        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "akcije", "link"]
         display_cols = [c for c in display_cols if c in fdf.columns]
 
         st.dataframe(
@@ -1161,7 +1122,6 @@ with tab_scan:
                 "ocena":        st.column_config.TextColumn("Ocena"),
                 "dostava":      st.column_config.TextColumn("Dostava"),
                 "novo":         st.column_config.TextColumn("Novi"),
-                "item_popusti": st.column_config.TextColumn("🏷️ Item pop."),
                 "akcije":       st.column_config.TextColumn("Akcije", width="large"),
                 "link":         st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
             },
@@ -1325,8 +1285,7 @@ with tab_alert:
         def should_alert(row):
             filtered = filter_akcije_for_email(row["akcije"])
             has_real_promo   = filtered != "-"
-            has_item_popusti = row.get("item_popusti") == "Da"
-            return has_real_promo or has_item_popusti
+            return has_real_promo
 
         merged["_alert"] = merged.apply(should_alert, axis=1)
         sa_akcijama = merged[merged["_alert"]].copy()
@@ -1355,7 +1314,7 @@ with tab_alert:
             st.caption(
                 f"Partnera za alert: **{len(preview)}** | "
                 f"AM-ova: **{preview['am_name'].nunique()}** | "
-                f"Sa item popustima: **{len(preview[preview['item_popusti']=='Da'])}**"
+                f"Ukupno akcija: **{len(preview[preview['akcije_email'] != '-'])}**"
             )
 
             # Preview kolone – bez posebne item_popusti kolone (sve je u akcije_email)
@@ -1397,7 +1356,7 @@ with tab_alert:
                             "naziv":        row["naziv"],
                             "grad":         row["grad"],
                             "akcije":       row["akcije"],
-                            "item_popusti": row.get("item_popusti", "Ne"),
+
                             "link":         row.get("link", ""),
                         }
                         for _, row in grp.iterrows()
