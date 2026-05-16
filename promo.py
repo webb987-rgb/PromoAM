@@ -313,7 +313,7 @@ def _parse_dynamic_with_item_discount(data: dict) -> list:
     for disc in venue_raw.get("discounts", []):
         if not isinstance(disc, dict):
             continue
-        is_wp = disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False)
+        is_wp = (disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False) or (disc.get("conditions") or {}).get("has_wolt_plus") == True)
 
         banner = disc.get("banner") or {}
         desc   = disc.get("description") or {}
@@ -406,7 +406,7 @@ def _parse_dynamic(data: dict) -> list:
     for disc in venue_raw.get("discounts", []):
         if not isinstance(disc, dict):
             continue
-        is_wp = disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False)
+        is_wp = (disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False) or (disc.get("conditions") or {}).get("has_wolt_plus") == True)
         banner = disc.get("banner") or {}
         add(banner.get("formatted_text"), wolt_plus=is_wp)
         desc = disc.get("description") or {}
