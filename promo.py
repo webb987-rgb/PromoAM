@@ -25,7 +25,8 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 10
+FETCH_WORKERS = 5          # Manji broj threadova → manje 429
+FETCH_DELAY   = 0.4       # Pauza između svakog fetch-a po threadu (sekunde)
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -243,7 +244,18 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
     Fetches a single URL sa retry logikom.
     Vraća (response_json_or_None, status_code).
     Globalni throttle se primjenjuje pri svakom pokušaju.
+
+    Strategija:
+    - Per-request delay (FETCH_DELAY) sprečava burst pre nego što dođe 429
+    - 429 throttle je kraći (1.5s * 2^attempt): 1.5s, 3s, 6s
+    - Jitter ±0.2s sprečava thundering herd (svi threadovi ne kreću istovremeno)
     """
+    import random
+
+    # Mali per-request delay sa jitterom – ključno za prevenciju 429
+    jitter = random.uniform(-0.2, 0.2)
+    time.sleep(max(0, FETCH_DELAY + jitter))
+
     for attempt in range(4):
         if stop_event.is_set():
             return None, 0
@@ -256,9 +268,10 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
                 _log_fetch(f"{label} → {r.status_code} (auth fail)")
                 return None, r.status_code
             if r.status_code == 429:
-                wait = 2 + 2 ** attempt   # 3s, 5s, 9s
+                # Kraći throttle: 1.5s, 3s, 6s (umesto 3s, 5s, 9s)
+                wait = 1.5 * (2 ** attempt)
                 _set_throttle(wait)
-                _log_fetch(f"{label} → 429 retry {attempt} (throttle {wait:.0f}s)")
+                _log_fetch(f"{label} → 429 retry {attempt} (throttle {wait:.1f}s)")
                 continue
             _log_fetch(f"{label} → {r.status_code}")
             return None, r.status_code
@@ -556,7 +569,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
             break  # nema više stranica
 
         skip += 40
-        time.sleep(0.2)
+        time.sleep(0.1)  # 0.2 → 0.1: paginacija je retka, može brže
 
     if not restaurants or stop_event.is_set():
         if not restaurants:
@@ -1573,8 +1586,10 @@ Cookie traje ~24h.
 
     st.markdown("---")
     st.markdown("#### ⚙️ Podešavanja fetcha")
-    st.info(f"Trenutni broj paralelnih radnika: **{FETCH_WORKERS}**. "
-            "Ako dobijaš 429 greške, smanji `FETCH_WORKERS` u kodu (npr. na 5).")
+    st.info(f"Trenutni broj paralelnih radnika: **{FETCH_WORKERS}**, "
+            f"delay po requestu: **{FETCH_DELAY}s** (±0.2s jitter). "
+            "Ako dobijaš 429 greške, poveći `FETCH_DELAY` u kodu (npr. 0.6). "
+            "Ako je previše sporo, smanji ga (min 0.2) ili poveći `FETCH_WORKERS` (max 8).")
 
     st.markdown("---")
     st.markdown("#### 🚫 Filtrirane akcije iz emaila")
