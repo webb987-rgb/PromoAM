@@ -201,84 +201,32 @@ def make_thread_session() -> requests.Session:
 def _parse_dynamic(data: dict) -> tuple[list, bool]:
     """
     Parsira dynamic endpoint i vraća (lista_akcija, ima_item_popust).
-    Čita iz:
-      - venue_raw.discounts[].banner.formatted_text  (primarni)
-      - venue_raw.discounts[].description.title      (fallback)
-      - venue.banners[].discount.formatted_text      (sekundarni)
-      - venue.offer_assistant.offer_trackers[].title (tercijalni)
+
+    Čita ISKLJUČIVO formatted_text iz dve lokacije:
+      1. venue.banners[N].discount.formatted_text
+      2. venue_raw.discounts[N].banner.formatted_text
+
+    Svaki pronađeni tekst = jedna akcija. Duplikati se preskačaju.
+    ima_item_popust = True ako bilo koja akcija sadrži "discount on selected".
     """
     akcije = []
     seen   = set()
     ima_item_popust = False
 
-    SKIP = {
-        "show details", "prikaži detalje", "see all", "vidi sve",
-        "more", "još", "naruči", "see menu",
-        "add {amount} more", "try for 30 days for free!",
-        "get rsd0 delivery fee & more!",
-    }
-
     def add(text, wolt_plus=False):
         t = (text or "").strip()
-        if not t or t.lower() in SKIP:
+        if not t:
             return
         prefix = "• [Wolt+] " if wolt_plus else "• "
         key = t.lower()
         if key not in seen:
             seen.add(key)
             akcije.append(f"{prefix}{t}")
+            if "discount on selected" in key or "popust na izabrane" in key:
+                nonlocal ima_item_popust
+                ima_item_popust = True
 
-    # ── venue_raw.discounts ───────────────────────────────────────────────────
-    venue_raw = data.get("venue_raw") or {}
-    for disc in venue_raw.get("discounts", []):
-        if not isinstance(disc, dict):
-            continue
-
-        is_wp = bool(
-            disc.get("has_wolt_plus") or
-            (disc.get("banner") or {}).get("show_wolt_plus") or
-            (disc.get("conditions") or {}).get("has_wolt_plus")
-        )
-
-        # Tekst: banner ima prioritet, onda description.title
-        banner = disc.get("banner") or {}
-        desc   = disc.get("description") or {}
-        tekst  = (banner.get("formatted_text") or "").strip() or (desc.get("title") or "").strip()
-        add(tekst, wolt_plus=is_wp)
-
-        # Detektuj item popust
-        effects    = disc.get("effects") or {}
-        item_disc  = effects.get("item_discount")
-        if isinstance(item_disc, dict) and (item_disc.get("fraction") or 0) > 0:
-            ima_item_popust = True
-            # Ako nema tekst, napravi ga iz procenta
-            if not tekst:
-                pct = int(round(float(item_disc["fraction"]) * 100))
-                add(f"{pct}% popust na izabrane artikle", wolt_plus=is_wp)
-
-        # Basket discount – fallback tekst
-        basket = effects.get("basket_discount")
-        if isinstance(basket, dict) and not tekst:
-            if (basket.get("amount") or 0) > 0:
-                add(f"{int(basket['amount'])//100} RSD popust na korpu", wolt_plus=is_wp)
-            elif (basket.get("fraction") or 0) > 0:
-                add(f"{int(round(basket['fraction']*100))}% popust na korpu", wolt_plus=is_wp)
-
-        # Delivery discount – fallback tekst
-        delivery = effects.get("delivery_discount")
-        if isinstance(delivery, dict) and not tekst:
-            amt = delivery.get("amount")
-            frc = delivery.get("fraction") or 0
-            if amt == 0 or frc >= 1.0:
-                add("Besplatna dostava", wolt_plus=is_wp)
-            elif (amt or 0) > 0:
-                add(f"{int(amt)//100} RSD popust na dostavu", wolt_plus=is_wp)
-
-        # Free items
-        if effects.get("free_items") and not tekst:
-            add("Gratis artikal uz porudžbinu", wolt_plus=is_wp)
-
-    # ── venue.banners ─────────────────────────────────────────────────────────
+    # ── 1. venue.banners[N].discount.formatted_text ───────────────────────────
     venue = data.get("venue") or {}
     for ban in venue.get("banners", []):
         if not isinstance(ban, dict):
@@ -287,13 +235,18 @@ def _parse_dynamic(data: dict) -> tuple[list, bool]:
         disc  = ban.get("discount") or {}
         add((disc.get("formatted_text") or "").strip(), wolt_plus=is_wp)
 
-    # ── offer_trackers ────────────────────────────────────────────────────────
-    offer_assistant = venue.get("offer_assistant") or {}
-    for tracker in offer_assistant.get("offer_trackers", []):
-        if not isinstance(tracker, dict):
+    # ── 2. venue_raw.discounts[N].banner.formatted_text ──────────────────────
+    venue_raw = data.get("venue_raw") or {}
+    for disc in venue_raw.get("discounts", []):
+        if not isinstance(disc, dict):
             continue
-        is_wp = tracker.get("offer_type") == "wolt_plus"
-        add((tracker.get("title") or "").strip(), wolt_plus=is_wp)
+        is_wp = bool(
+            disc.get("has_wolt_plus") or
+            (disc.get("banner") or {}).get("show_wolt_plus") or
+            (disc.get("conditions") or {}).get("has_wolt_plus")
+        )
+        banner = disc.get("banner") or {}
+        add((banner.get("formatted_text") or "").strip(), wolt_plus=is_wp)
 
     return akcije, ima_item_popust
 
@@ -301,8 +254,8 @@ def _parse_dynamic(data: dict) -> tuple[list, bool]:
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list,
                stop_event: threading.Event) -> tuple[str, str, str]:
     """
-    Fetchuje akcije za jedan restoran.
-    Uvek poziva dynamic endpoint – feed_akcije (iz listing feed-a) se dodaju na rezultat.
+    Fetchuje akcije za jedan restoran ISKLJUČIVO iz dynamic endpointa.
+    feed_akcije parametar se ignoriše – koristi se samo dynamic API.
     """
     if stop_event.is_set():
         return slug, "-", "Ne"
@@ -311,7 +264,7 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list,
     akcije_str   = "-"
     item_popusti = "Ne"
 
-    # ── Dynamic endpoint – glavni izvor akcija ────────────────────────────────
+    # ── Dynamic endpoint – jedini izvor akcija ────────────────────────────────
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
@@ -325,9 +278,7 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list,
                 parsed, ima_item = _parse_dynamic(r.json())
                 if ima_item:
                     item_popusti = "Da"
-                # Spoji feed akcije + dynamic (bez duplikata)
-                sve = list(dict.fromkeys(feed_akcije + parsed))
-                akcije_str = "\n".join(sve) if sve else "-"
+                akcije_str = "\n".join(parsed) if parsed else "-"
                 break
             elif r.status_code == 429:
                 time.sleep(2 ** attempt)
@@ -336,47 +287,6 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list,
         except Exception:
             if attempt < 2:
                 time.sleep(0.3)
-    else:
-        # Dynamic nije odgovorio – koristi bar feed akcije
-        if feed_akcije:
-            akcije_str = "\n".join(feed_akcije)
-
-    if stop_event.is_set():
-        return slug, akcije_str, item_popusti
-
-    # ── Assortment – samo ako dynamic nije već potvrdio item popust ──────────
-    if item_popusti == "Ne":
-        ass_url = (
-            f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1"
-            f"/venues/slug/{slug}/assortment"
-        )
-        for attempt in range(2):
-            if stop_event.is_set():
-                break
-            try:
-                r = ts.get(ass_url, timeout=8)
-                if r.status_code == 200:
-                    for item in r.json().get("items", []):
-                        price = (item.get("base_price") or item.get("price") or 0)
-                        orig  = (
-                            item.get("original_price") or
-                            item.get("strikethrough_price") or
-                            item.get("compare_at_price") or 0
-                        )
-                        if orig > price > 0:
-                            item_popusti = "Da"
-                            break
-                        if item.get("discount_percentage") or item.get("discounts"):
-                            item_popusti = "Da"
-                            break
-                    break
-                elif r.status_code == 429:
-                    time.sleep(2 ** attempt)
-                else:
-                    break
-            except Exception:
-                if attempt < 1:
-                    time.sleep(0.3)
 
     return slug, akcije_str, item_popusti
 
@@ -428,49 +338,10 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                     est      = venue.get("estimate_range") or venue.get("estimate")
                     delivery = f"{est} min" if est else "-"
 
-                    feed_akcije = []
                     novo_status = "Ne"
-                    seen_feed = set()
-
-                    def _feed_add(txt):
-                        t = (txt or "").strip()
-                        if not t or len(t) <= 2:
-                            return
-                        if t.lower() in ["novo", "new"]:
-                            nonlocal novo_status
-                            novo_status = "Da"
-                            return
-                        k = t.lower()
-                        if k not in seen_feed:
-                            seen_feed.add(k)
-                            feed_akcije.append(f"• {t}")
-
-                    # badges[] – tekst i npr. "40% off"
                     for badge in venue.get("badges", []):
-                        _feed_add(badge.get("text", ""))
-                        _feed_add(badge.get("label", ""))
-
-                    # label – kratka promo poruka na kartici
-                    _feed_add(venue.get("label", ""))
-
-                    # tag – marketing tag (npr. "Free delivery", "20% off")
-                    _feed_add(venue.get("tag", ""))
-
-                    # marketing_tags[] – lista marketing tagova
-                    for mt in (venue.get("marketing_tags") or []):
-                        if isinstance(mt, dict):
-                            _feed_add(mt.get("text") or mt.get("label") or "")
-                        elif isinstance(mt, str):
-                            _feed_add(mt)
-
-                    # short_description – ponekad sadrži promo tekst
-                    sd = venue.get("short_description") or ""
-                    promo_kw = ["off", "popust", "free", "besplatno", "gratis", "%", "discount"]
-                    if any(kw in sd.lower() for kw in promo_kw):
-                        _feed_add(sd)
-
-                    # feed_has_promo – flag koji koristimo u _fetch_one da preskočimo dynamic
-                    feed_has_promo = bool(feed_akcije)
+                        if badge.get("text", "").lower() in ["novo", "new"] or badge.get("label", "").lower() in ["novo", "new"]:
+                            novo_status = "Da"
 
                     restaurants[slug] = {
                         "grad":           city_display,
@@ -480,8 +351,8 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                         "ocena":          str(r_score),
                         "dostava":        delivery,
                         "novo":           novo_status,
-                        "_feed_akcije":   feed_akcije,
-                        "_feed_has_promo": feed_has_promo,
+                        "_feed_akcije":   [],
+                        "_feed_has_promo": False,
                         "item_popusti":   "Ne",
                         "akcije":         "-",
                         "link":           f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
