@@ -176,13 +176,21 @@ def fetch_dynamic_discounts(slug: str, lat: float, lon: float) -> list:
         desc = disc.get("description") or {}
         add(desc.get("title"))
 
-    # Takodje provjeri venue.banners[] za isti tekst
+    # venue.banners[].discount.formatted_text
     venue = data.get("venue") or {}
     for banner in venue.get("banners", []):
         if not isinstance(banner, dict):
             continue
         disc = banner.get("discount") or {}
         add(disc.get("formatted_text"))
+
+    # venue.offer_assistant.offer_trackers[].title  (vidljivo u Network tabu)
+    offer_assistant = venue.get("offer_assistant") or {}
+    for tracker in offer_assistant.get("offer_trackers", []):
+        if not isinstance(tracker, dict):
+            continue
+        add(tracker.get("title"))
+        add(tracker.get("applied_subtitle"))
 
     return list(akcije)
 
@@ -289,22 +297,36 @@ def fetch_city(city: str, status_placeholder) -> list[dict]:
     progress_text = f"🎯 Učitavam detaljne akcije za {city}..."
     progress_bar = st.progress(0, text=progress_text)
     
-    # Sekvencijalno sa pauzom - Wolt rate-limituje ako šaljemo previše simultanih zahteva
+    # Batch paralelizam: BATCH_SIZE threadova simultano, pauza između batch-eva
+    # 1600 restorana / 10 po batchu * 0.3s = ~48s umesto 13min
+    BATCH_SIZE = 10
+    BATCH_PAUSE = 0.3  # sekunde između batch-eva
+
     completed = 0
-    for slug in slugs:
-        try:
-            dynamic_akcije = fetch_dynamic_discounts(slug, lat, lon)
-        except Exception:
-            dynamic_akcije = []
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch_slugs = slugs[batch_start:batch_start + BATCH_SIZE]
 
-        sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
-        restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
+        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
+            futures = {pool.submit(fetch_dynamic_discounts, slug, lat, lon): slug
+                       for slug in batch_slugs}
+            for fut in as_completed(futures):
+                slug = futures[fut]
+                try:
+                    dynamic_akcije = fut.result()
+                except Exception:
+                    dynamic_akcije = []
 
-        completed += 1
-        if completed % 5 == 0 or completed == total:
-            progress_bar.progress(completed / total, text=f"{progress_text} ({completed}/{total})")
-        
-        time.sleep(0.5)  # pauza da ne triggerjemo rate-limit
+                sve_akcije = set(restaurants[slug]["akcije_feed"] + dynamic_akcije)
+                restaurants[slug]["akcije"] = "\n".join(sorted(sve_akcije)) if sve_akcije else "-"
+
+                completed += 1
+
+        progress_bar.progress(
+            completed / total,
+            text=f"{progress_text} ({completed}/{total})"
+        )
+        if batch_start + BATCH_SIZE < total:
+            time.sleep(BATCH_PAUSE)
 
     progress_bar.empty()
     
@@ -440,8 +462,8 @@ with tab_scan:
         if not df.empty:
             st.session_state.df_wolt = df
             st.session_state.last_scan = local_now()
-            st.success(f"✅ Scan završen! Pronađeno **{len(df)}** restorana.")
-            st.rerun()
+            st.success(f"✅ Scan završen! Pronađeno **{len(df)}** restorana, "
+                       f"od toga **{len(df[df['akcije'] != '-'])}** sa akcijama.")
         else:
             st.error("❌ Scan nije vratio podatke. Proveri internet konekciju.")
 
@@ -480,6 +502,22 @@ with tab_scan:
         with fc4:
             search = st.text_input("🔎 Pretraži naziv:", key="scan_search")
 
+        # Filter po tipu akcije
+        sve_akcije_tekst = sorted(set(
+            line.lstrip("• ").strip()
+            for akcije_cell in df["akcije"]
+            if akcije_cell != "-"
+            for line in akcije_cell.split("\n")
+            if line.strip() and line.strip() != "-"
+        ))
+        akcija_filter = st.multiselect(
+            "🎯 Filtriraj po akciji (pretraži i izaberi):",
+            options=sve_akcije_tekst,
+            default=[],
+            placeholder="Sve akcije – ili izaberi specifičnu...",
+            key="scan_akcija_filter"
+        )
+
         fdf = df[df["grad"].isin(grad_filter)]
         if samo_akcije:
             fdf = fdf[fdf["akcije"] != "-"]
@@ -487,6 +525,11 @@ with tab_scan:
             fdf = fdf[fdf["novo"] == "Da"]
         if search.strip():
             fdf = fdf[fdf["naziv"].str.contains(search.strip(), case=False, na=False)]
+        if akcija_filter:
+            mask = fdf["akcije"].apply(
+                lambda cell: any(a in cell for a in akcija_filter) if cell != "-" else False
+            )
+            fdf = fdf[mask]
 
         st.caption(f"Prikazano: **{len(fdf)}** restorana")
 
