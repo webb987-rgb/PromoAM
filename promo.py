@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 10
+FETCH_WORKERS = 40
 
 EMAIL_IGNORE_PROMOS = [
     "0 din delivery fee for 14 days",
@@ -408,20 +408,23 @@ def _has_item_discounts(data: dict) -> bool:
 
 # ─────────────────────────── FETCH GRAD ──────────────────────────────────────
 
-def fetch_city(city_display: str, stop_event: threading.Event) -> list[dict]:
+def fetch_city(city_display: str, status_placeholder, stop_event: threading.Event) -> list[dict]:
     city_key  = display_to_key(city_display)
     city_slug = CITY_SLUG_MAP.get(city_key)
     coords    = CITY_COORDS.get(city_key)
 
     if not city_slug or not coords:
+        status_placeholder.error(f"❌ Nepoznat grad: '{city_display}'")
         return []
 
     lat, lon = coords
     restaurants = {}
     skip = 0
 
-    st.session_state["_scan_status"] = f"🔍 Učitavam listu restorana za {city_display}..."
+    status_placeholder.info(f"🔍 Učitavam listu restorana za **{city_display}**...")
 
+    # ── Paginacija – SAMO restaurants endpoint (delivery je duplikat) ─────────
+    # Preskačemo delivery endpoint koji vraćao 0 dodatnih – to je bio problem br. 1
     for page_num in range(50):
         if stop_event.is_set():
             break
@@ -482,8 +485,8 @@ def fetch_city(city_display: str, stop_event: threading.Event) -> list[dict]:
                     }
 
         new_this_page = len(restaurants) - count_before
-        st.session_state["_scan_status"] = (
-            f"🚴 {city_display}: stranica {page_num+1} – +{new_this_page} novih "
+        status_placeholder.info(
+            f"🚴 **{city_display}**: str. {page_num+1} – +{new_this_page} novih "
             f"(ukupno {len(restaurants)})"
         )
 
@@ -494,14 +497,16 @@ def fetch_city(city_display: str, stop_event: threading.Event) -> list[dict]:
         time.sleep(0.2)
 
     if not restaurants or stop_event.is_set():
+        if not restaurants:
+            status_placeholder.warning(f"⚠️ **{city_display}**: nije pronađen nijedan restoran.")
         return []
 
     # ── Paralelno fetchovanje akcija ──────────────────────────────────────────
     slugs = list(restaurants.keys())
     total = len(slugs)
+    progress_text = f"⚡ Učitavam akcije za {city_display} ({total} restorana)..."
+    progress_bar = st.progress(0, text=progress_text)
     completed = 0
-    st.session_state["_scan_status"] = f"⚡ Učitavam akcije za {city_display} ({total} restorana)..."
-    st.session_state["_scan_progress"] = 0.0
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
         futures = {
@@ -529,10 +534,12 @@ def fetch_city(city_display: str, stop_event: threading.Event) -> list[dict]:
 
             completed += 1
             if completed % 5 == 0 or completed == total:
-                st.session_state["_scan_progress"] = min(completed / total, 1.0)
-                st.session_state["_scan_status"] = (
-                    f"⚡ {city_display}: {completed}/{total} restorana obrađeno..."
+                progress_bar.progress(
+                    min(completed / total, 1.0),
+                    text=f"⚡ {city_display}: {completed}/{total} restorana obrađeno..."
                 )
+
+    progress_bar.empty()
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
@@ -540,20 +547,23 @@ def fetch_city(city_display: str, stop_event: threading.Event) -> list[dict]:
     return list(restaurants.values())
 
 
-def scan_all_cities(selected_cities: list[str], stop_event: threading.Event) -> pd.DataFrame:
+def scan_all_cities(selected_cities: list[str], status_placeholder, stop_event: threading.Event) -> pd.DataFrame:
     all_rows = []
     for i, city in enumerate(selected_cities):
         if stop_event.is_set():
             break
         try:
-            rows = fetch_city(city, stop_event)
+            rows = fetch_city(city, status_placeholder, stop_event)
             all_rows.extend(rows)
             if not stop_event.is_set():
-                st.session_state["_scan_status"] = f"✅ {city} završen! ({len(rows)} restorana)"
+                status_placeholder.success(f"✅ {city} završen! ({len(rows)} restorana)")
         except Exception as e:
-            st.session_state["_scan_status"] = f"❌ Greška za {city}: {e}"
+            status_placeholder.error(f"❌ Greška za {city}: {e}")
+            import traceback
+            st.error(traceback.format_exc())
         if i < len(selected_cities) - 1 and not stop_event.is_set():
             time.sleep(0.5)
+    status_placeholder.empty()
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
 # ─────────────────────────── EMAIL ───────────────────────────────────────────
@@ -679,8 +689,15 @@ def run_scheduled_scan_and_send():
     log.info(f"[Scheduler] Pokrenuo sken za gradove: {cfg['cities']}")
     stop_ev = threading.Event()
 
+    class NullPH:
+        def info(self, *a, **kw): pass
+        def warning(self, *a, **kw): pass
+        def success(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+        def empty(self, *a, **kw): pass
+
     try:
-        df = scan_all_cities(cfg["cities"], stop_ev)
+        df = scan_all_cities(cfg["cities"], NullPH(), stop_ev)
     except Exception as e:
         log.error(f"[Scheduler] Greška pri skenu: {e}")
         return
@@ -821,7 +838,12 @@ with tab_scan:
             type="secondary",
         )
     with col_info:
-        if st.session_state.last_scan:
+        # Timer prikaz
+        if st.session_state.scan_running and st.session_state.scan_start_time:
+            elapsed = time.time() - st.session_state.scan_start_time
+            m, s = divmod(int(elapsed), 60)
+            st.markdown(f"<div class='timer-box'>⏱️ Skeniranje traje: {m:02d}:{s:02d}</div>", unsafe_allow_html=True)
+        elif st.session_state.last_scan:
             st.info(f"⏱️ Poslednji scan: **{st.session_state.last_scan}** | "
                     f"Ukupno restorana: **{len(st.session_state.df_wolt)}**")
         if not selected_cities:
@@ -845,7 +867,8 @@ with tab_scan:
     # Zaustavljanje
     if stop_scan and st.session_state.scan_running:
         st.session_state.scan_stop_event.set()
-        st.warning("⏹️ Zaustavljanje... čeka se da threadovi završe.")
+        st.session_state.scan_running = False
+        st.warning("⏹️ Skeniranje zaustavljeno.")
 
     # Pokretanje skena
     if run_scan and selected_cities and not st.session_state.scan_running:
@@ -855,58 +878,31 @@ with tab_scan:
         elif "Cookie" in session.headers:
             del session.headers["Cookie"]
 
+        # Reset stop eventa
         st.session_state.scan_stop_event = threading.Event()
         st.session_state.scan_running = True
         st.session_state.scan_start_time = time.time()
-        st.session_state["_scan_result"] = None
-        st.session_state["_scan_done"] = False
 
-        _cities_snap = list(selected_cities)
-        _stop_ev_snap = st.session_state.scan_stop_event
+        ph = st.empty()
+        stop_ev = st.session_state.scan_stop_event
 
-        def _run_scan_bg():
-            result = scan_all_cities(_cities_snap, _stop_ev_snap)
-            st.session_state["_scan_result"] = result
-            st.session_state["_scan_done"] = True
-            st.session_state.scan_running = False
+        df = scan_all_cities(selected_cities, ph, stop_ev)
 
-        bg = threading.Thread(target=_run_scan_bg, daemon=True)
-        bg.start()
-        st.rerun()
+        scan_duration = time.time() - st.session_state.scan_start_time
+        st.session_state.scan_running = False
 
-    # Prikaz statusa dok scan traje
-    if st.session_state.scan_running:
-        elapsed = time.time() - (st.session_state.scan_start_time or time.time())
-        m2, s2 = divmod(int(elapsed), 60)
-        status_msg = st.session_state.get("_scan_status", "Skeniranje u toku...")
-        progress_val = st.session_state.get("_scan_progress", 0.0)
-        st.markdown(f"<div class='timer-box'>⏱️ {m2:02d}:{s2:02d}</div>", unsafe_allow_html=True)
-        st.info(status_msg)
-        if progress_val > 0:
-            st.progress(progress_val)
-        time.sleep(2)
-        st.rerun()
-
-    # Prikaz rezultata kad scan završi
-    if st.session_state.get("_scan_done"):
-        df_result = st.session_state.get("_scan_result")
-        scan_duration = time.time() - (st.session_state.scan_start_time or time.time())
-        st.session_state["_scan_done"] = False
-        _stop_ev = st.session_state.scan_stop_event
-        if df_result is not None and not df_result.empty:
-            st.session_state.df_wolt = df_result
+        if not df.empty:
+            st.session_state.df_wolt = df
             st.session_state.last_scan = local_now()
-            save_scan(df_result)
+            save_scan(df)  # Sačuvaj permanentno
             m, s = divmod(int(scan_duration), 60)
-            sa_item = len(df_result[df_result["item_popusti"] == "Da"]) if "item_popusti" in df_result.columns else 0
             st.success(
                 f"✅ Scan završen za **{m:02d}:{s:02d}**! "
-                f"Pronađeno **{len(df_result)}** restorana, "
-                f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama, "
-                f"**{sa_item}** sa item popustima."
+                f"Pronađeno **{len(df)}** restorana, "
+                f"od toga **{len(df[df['akcije'] != '-'])}** sa akcijama."
             )
         else:
-            if _stop_ev.is_set():
+            if stop_ev.is_set():
                 st.warning("⏹️ Scan je zaustavljen pre završetka.")
             else:
                 st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
@@ -915,20 +911,17 @@ with tab_scan:
     if not df.empty:
         st.markdown("---")
 
-        k1, k2, k3, k4, k5 = st.columns(5)
+        k1, k2, k3, k4 = st.columns(4)
         total        = len(df)
         sa_akcijama  = len(df[df["akcije"] != "-"])
-        sa_item_kpi  = len(df[df["item_popusti"] == "Da"]) if "item_popusti" in df.columns else 0
-        bilo_sta     = len(df[(df["akcije"] != "-") | (df.get("item_popusti", pd.Series(dtype=str)) == "Da")])
         otvoreni     = len(df[df["status"] == "Otvoren"])
         novi         = len(df[df["novo"] == "Da"])
 
         for col, val, lbl in [
             (k1, total,       "Ukupno restorana"),
-            (k2, bilo_sta,    "Ima akciju (ukupno)"),
-            (k3, sa_akcijama, "Tekstualne akcije"),
-            (k4, sa_item_kpi, "Item popusti 🏷️"),
-            (k5, otvoreni,    "Trenutno otvoreno"),
+            (k2, sa_akcijama, "Sa aktivnim akcijama"),
+            (k3, otvoreni,    "Trenutno otvoreno"),
+            (k4, novi,        "Novih restorana"),
         ]:
             with col:
                 st.markdown(f"""
@@ -1407,29 +1400,9 @@ with tab_sched:
     st.markdown("---")
     st.markdown("#### 🧪 Test – pokreni ručno odmah")
     st.caption("Radi isto kao automatski sken ali se pokreće odmah. Korisno za testiranje.")
-
-    sched_running = st.session_state.get("sched_running", False)
-    sched_done    = st.session_state.get("sched_done", False)
-
-    if st.button("▶️ Pokreni test sken + slanje sada", key="sched_test", disabled=sched_running):
-        st.session_state["sched_running"] = True
-        st.session_state["sched_done"]    = False
-
-        def _run_sched_bg():
+    if st.button("▶️ Pokreni test sken + slanje sada", key="sched_test"):
+        with st.spinner("Pokrenuo test sken..."):
             run_scheduled_scan_and_send()
-            st.session_state["sched_running"] = False
-            st.session_state["sched_done"]    = True
-
-        threading.Thread(target=_run_sched_bg, daemon=True).start()
-        st.rerun()
-
-    if sched_running:
-        st.info("🔄 Automatski sken u toku... stranica se osvežava svakih 3s.")
-        time.sleep(3)
-        st.rerun()
-
-    if sched_done:
-        st.session_state["sched_done"] = False
         st.success("✅ Test završen. Proveri statistiku i log.")
 
     # Prikaz sledećeg raspoređenog pokretanja
