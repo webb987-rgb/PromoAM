@@ -284,17 +284,35 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
 
 
 def _dynamic_has_item_discount(data: dict) -> bool:
-    """Brza provera da li dynamic endpoint sadrži item_discount efekat."""
+    """
+    Brza provera da li dynamic endpoint sadrži item_discount efekat.
+    Pokriva i 'checkout discount' tip gde se popust oduzima pri plaćanju.
+    """
     venue_raw = data.get("venue_raw") or {}
     for disc in venue_raw.get("discounts", []):
         if not isinstance(disc, dict):
             continue
         effects = disc.get("effects") or {}
+
+        # Klasični item_discount (fraction > 0)
         item_disc = effects.get("item_discount")
         if item_disc and isinstance(item_disc, dict):
             fraction = item_disc.get("fraction")
             if fraction and float(fraction) > 0:
                 return True
+
+        # Checkout tip: discount_type == "item" ili target == "item"
+        disc_type = str(disc.get("discount_type") or disc.get("type") or "").lower()
+        target    = str(disc.get("target") or "").lower()
+        if "item" in disc_type or "item" in target:
+            return True
+
+        # Checkout tip: banner tekst sadrži "checkout" i procenat
+        banner = disc.get("banner") or {}
+        banner_text = str(banner.get("formatted_text") or "").lower()
+        if "checkout" in banner_text and any(c.isdigit() for c in banner_text):
+            return True
+
     return False
 
 def _parse_dynamic_with_item_discount(data: dict) -> list:
@@ -386,6 +404,16 @@ def _parse_dynamic_with_item_discount(data: dict) -> list:
             fallback = primary_text or "Gratis artikal uz porudžbinu"
             add(fallback, wolt_plus=is_wp)
 
+        # ── Checkout tip popusta (npr. "40% discount deducted at checkout") ───
+        # Wolt ponekad ne šalje effects nego samo discount_type/target + banner tekst
+        if not primary_text:
+            disc_type = str(disc.get("discount_type") or disc.get("type") or "").lower()
+            target    = str(disc.get("target") or "").lower()
+            pct_field = disc.get("percentage") or disc.get("discount_percentage") or disc.get("percent")
+            if pct_field and ("item" in disc_type or "item" in target):
+                pct = int(round(float(pct_field)))
+                add(f"{pct}% popust na izabrane artikle (na checkout-u)", wolt_plus=is_wp)
+
     # venue.banners – banneri prikazani na stranici restorana
     venue = data.get("venue") or {}
     for ban in venue.get("banners", []):
@@ -450,7 +478,15 @@ def _parse_dynamic(data: dict) -> list:
 
 
 def _has_item_discounts(data: dict) -> bool:
+    """
+    Detektuje item popuste iz assortment endpointa.
+    Pokriva dva tipa:
+    1. Vidljivi popust: original_price > price (precrtan cena na kartici)
+    2. Checkout popust: discount_percentage / discounts niz / discount_label
+       (tekst "X% discount will be deducted at checkout" – cena nije precrtnuta)
+    """
     for item in data.get("items", []):
+        # Tip 1: precrtnuta cena
         price = (item.get("base_price") or item.get("price") or 0) / 100
         orig = (
             item.get("original_price") or
@@ -460,6 +496,25 @@ def _has_item_discounts(data: dict) -> bool:
         ) / 100
         if orig > 0 and orig > price:
             return True
+
+        # Tip 2: checkout popust (discount_percentage ili discounts lista)
+        if item.get("discount_percentage") or item.get("discount_percent"):
+            return True
+        discounts = item.get("discounts") or item.get("item_discounts") or []
+        if discounts:
+            return True
+        # Wolt ponekad šalje samo tekst tag kao "discount_label" ili "tag"
+        discount_label = item.get("discount_label") or item.get("discount_tag") or ""
+        if discount_label:
+            return True
+        # "baskets" ili "tags" niz sa discount tipom
+        for tag in (item.get("tags") or []):
+            if isinstance(tag, dict):
+                if "discount" in str(tag.get("type", "")).lower():
+                    return True
+            elif isinstance(tag, str) and "discount" in tag.lower():
+                return True
+
     return False
 
 # ─────────────────────────── FETCH GRAD ──────────────────────────────────────
@@ -770,13 +825,13 @@ def run_scheduled_scan_and_send():
 
     df["naziv_norm"] = df["naziv"].apply(normalize)
     merged = df.merge(
-        amm_df[["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]],
+        amm_df[["restaurant_norm", "restaurant_display", "am_name", "am_email"]],
         left_on="naziv_norm", right_on="restaurant_norm", how="inner"
     )
 
     def should_alert(row):
         filtered = filter_akcije_for_email(row["akcije"])
-        return filtered != "-" or row.get("item_popusti") == "Da"
+        return bool(filtered != "-" or str(row.get("item_popusti", "Ne")) == "Da")
 
     merged["_alert"] = merged.apply(should_alert, axis=1)
     sa_akcijama = merged[merged["_alert"]].copy()
@@ -1279,15 +1334,15 @@ with tab_alert:
         amm_df["restaurant_norm"]     = amm_df["restaurant_norm"].apply(str)
 
         merged = df_wolt.merge(
-            amm_df[["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]],
+            amm_df[["restaurant_norm", "restaurant_display", "am_name", "am_email"]],
             left_on="naziv_norm", right_on="restaurant_norm", how="inner"
         )
 
         def should_alert(row):
             filtered = filter_akcije_for_email(row["akcije"])
             has_real_promo   = filtered != "-"
-            has_item_popusti = row.get("item_popusti") == "Da"
-            return has_real_promo or has_item_popusti
+            has_item_popusti = str(row.get("item_popusti", "Ne")) == "Da"
+            return bool(has_real_promo or has_item_popusti)
 
         merged["_alert"] = merged.apply(should_alert, axis=1)
         sa_akcijama = merged[merged["_alert"]].copy()
@@ -1635,14 +1690,41 @@ Cookie traje ~24h.
         if dyn_data:
             with st.expander("Pun JSON (dynamic)", expanded=True):
                 st.json(dyn_data)
-            st.markdown("**Parsed akcije:**")
-            parsed = _parse_dynamic(dyn_data)
+            st.markdown("**Parsed akcije (full parser):**")
+            parsed = _parse_dynamic_with_item_discount(dyn_data)
             for p in parsed:
                 st.write(p)
             if not parsed:
                 st.warning("Nema parsiranih akcija.")
+            st.markdown(f"**Item discount u dynamic:** `{_dynamic_has_item_discount(dyn_data)}`")
         else:
             st.warning(f"Dynamic endpoint nije vratio podatke. HTTP status: {dyn_status}")
+
+        st.markdown("---")
+        st.markdown("#### 2b️⃣ Assortment endpoint (item popusti)")
+        ass_url_dbg = (
+            f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{debug_slug}/assortment"
+        )
+        ass_data, ass_status = wolt_get(ass_url_dbg)
+        if ass_data:
+            items = ass_data.get("items", [])
+            st.write(f"Ukupno artikala: **{len(items)}**")
+            st.write(f"**_has_item_discounts:** `{_has_item_discounts(ass_data)}`")
+            # Prikaži prvih 5 artikala sa svim discount poljima
+            discount_items = []
+            for it in items[:50]:
+                relevant = {k: v for k, v in it.items() if any(x in k.lower() for x in
+                    ["price", "discount", "tag", "original", "compare", "strikethrough", "percent"])}
+                if relevant:
+                    relevant["name"] = it.get("name", "?")
+                    discount_items.append(relevant)
+            if discount_items:
+                with st.expander(f"Artikli sa discount poljima (prvih {len(discount_items[:10])})"):
+                    st.json(discount_items[:10])
+            with st.expander("Pun JSON (assortment)"):
+                st.json(ass_data)
+        else:
+            st.warning(f"Assortment endpoint nije vratio podatke. HTTP status: {ass_status}")
 
         st.markdown("---")
         st.markdown("#### 3️⃣ Promotions endpoint")
