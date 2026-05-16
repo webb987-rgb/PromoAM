@@ -400,50 +400,34 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
 
     status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
 
-    from collections import Counter
-    status_counter = Counter()
+    sa_akcijama_count = 0
 
-    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _fetch_one,
-                slug,
-                restaurants[slug]["_lat"],
-                restaurants[slug]["_lon"],
-                restaurants[slug]["_feed_akcije"],
-                stop_event,
-            ): slug
-            for slug in slugs
-        }
+    for i, slug in enumerate(slugs):
+        if stop_event.is_set():
+            break
 
-        for future in as_completed(futures):
-            if stop_event.is_set():
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-            try:
-                slug, akcije_str, item_pop, status_log = future.result()
-                restaurants[slug]["akcije"]       = akcije_str
-                restaurants[slug]["item_popusti"] = item_pop
-                # Grupiši status za dijagnostiku
-                key = status_log.split("(")[0]  # "ok", "429", "http403", "exc:..."
-                status_counter[key] += 1
-            except Exception as e:
-                status_counter[f"future_exc:{type(e).__name__}"] += 1
+        slug_out, akcije_str, item_pop, status_log = _fetch_one(
+            slug,
+            restaurants[slug]["_lat"],
+            restaurants[slug]["_lon"],
+            restaurants[slug]["_feed_akcije"],
+            stop_event,
+        )
+        restaurants[slug]["akcije"]       = akcije_str
+        restaurants[slug]["item_popusti"] = item_pop
 
-            completed += 1
-            if completed % 20 == 0 or completed == total:
-                status_placeholder.info(
-                    f"⚡ **{city_display}**: {completed}/{total} | "
-                    + " | ".join(f"{k}:{v}" for k, v in status_counter.most_common())
-                )
+        if akcije_str != "-":
+            sa_akcijama_count += 1
 
-    # Prikaži finalnu statistiku
-    sa_akcijama = sum(1 for r in restaurants.values() if r["akcije"] != "-")
-    status_placeholder.info(
-        f"📊 **{city_display}** – statistika API odgovora: "
-        + " | ".join(f"{k}:{v}" for k, v in status_counter.most_common())
-        + f" | sa_akcijama:{sa_akcijama}/{total}"
-    )
+        completed = i + 1
+        if completed % 5 == 0 or completed == total:
+            status_placeholder.info(
+                f"⚡ **{city_display}**: {completed}/{total} | "
+                f"sa akcijama: {sa_akcijama_count} | {status_log}"
+            )
+
+        time.sleep(2)  # 2 sekunde između svakog restorana
+
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
