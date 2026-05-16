@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 3
+FETCH_WORKERS = 6
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -212,6 +212,9 @@ def make_thread_session() -> requests.Session:
 
 # Log fajl za debug fetch-a
 _fetch_log_lock = threading.Lock()
+# Globalni 429 throttle – kad jedan thread dobije 429, svi čekaju
+_throttle_until = 0.0
+_throttle_lock  = threading.Lock()
 
 def _log_fetch(msg: str):
     try:
@@ -221,81 +224,104 @@ def _log_fetch(msg: str):
     except Exception:
         pass
 
+def _wait_throttle():
+    """Čeka ako je globalni throttle aktivan."""
+    now = time.time()
+    with _throttle_lock:
+        wait = _throttle_until - now
+    if wait > 0:
+        time.sleep(wait)
+
+def _set_throttle(seconds: float):
+    """Postavlja globalni throttle za sve threadove."""
+    with _throttle_lock:
+        global _throttle_until
+        _throttle_until = max(_throttle_until, time.time() + seconds)
+
+def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
+    """
+    Fetches a single URL sa retry logikom.
+    Vraća (response_json_or_None, status_code).
+    Globalni throttle se primjenjuje pri svakom pokušaju.
+    """
+    for attempt in range(4):
+        if stop_event.is_set():
+            return None, 0
+        _wait_throttle()
+        try:
+            r = ts.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json(), 200
+            if r.status_code in (401, 403):
+                _log_fetch(f"{label} → {r.status_code} (auth fail)")
+                return None, r.status_code
+            if r.status_code == 429:
+                wait = 2 + 2 ** attempt   # 3s, 5s, 9s
+                _set_throttle(wait)
+                _log_fetch(f"{label} → 429 retry {attempt} (throttle {wait:.0f}s)")
+                continue
+            _log_fetch(f"{label} → {r.status_code}")
+            return None, r.status_code
+        except Exception as e:
+            _log_fetch(f"{label} → EXC {e}")
+            if attempt < 3:
+                time.sleep(0.5)
+    return None, -1
+
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str, str]:
     if stop_event.is_set():
         return slug, "-", "Ne"
 
     ts = make_thread_session()
 
-    # ── 1. Assortment – item_popusti ──────────────────────────────────────────
-    item_popusti = "Ne"
+    # ── Oba poziva PARALELNO unutar jednog thread-a ───────────────────────────
     ass_url = f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
-
-    for attempt in range(3):
-        if stop_event.is_set():
-            break
-        try:
-            r = ts.get(ass_url, timeout=12)
-            if r.status_code in (401, 403):
-                _log_fetch(f"ASS {slug} → {r.status_code} (auth fail)")
-                break
-            if r.status_code == 429:
-                _log_fetch(f"ASS {slug} → 429 retry {attempt}")
-                time.sleep(3 + 2 ** attempt)
-                continue
-            if r.status_code == 200:
-                if _has_item_discounts(r.json()):
-                    item_popusti = "Da"
-                break
-            _log_fetch(f"ASS {slug} → {r.status_code}")
-            break
-        except Exception as e:
-            _log_fetch(f"ASS {slug} → EXC {e}")
-            if attempt < 2:
-                time.sleep(0.3)
-
-    if stop_event.is_set():
-        return slug, "-", item_popusti
-
-    # ── 2. Dynamic – akcije tekst ─────────────────────────────────────────────
-    akcije_str = "-"
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
 
-    dyn_ok = False
-    for attempt in range(3):
-        if stop_event.is_set():
-            break
-        try:
-            r = ts.get(dyn_url, timeout=12)
-            if r.status_code in (401, 403):
-                _log_fetch(f"DYN {slug} → {r.status_code} (auth fail)")
-                break
-            if r.status_code == 429:
-                _log_fetch(f"DYN {slug} → 429 retry {attempt}")
-                time.sleep(3 + 2 ** attempt)
-                continue
-            if r.status_code == 200:
-                parsed = _parse_dynamic_with_item_discount(r.json())
-                combined = list(dict.fromkeys(feed_akcije + parsed))
-                akcije_str = "\n".join(combined) if combined else "-"
-                dyn_ok = True
-                if akcije_str == "-":
-                    _log_fetch(f"DYN {slug} → 200 ali NEMA akcija (parsed={parsed}, feed={feed_akcije})")
-                break
-            _log_fetch(f"DYN {slug} → {r.status_code}")
-            break
-        except Exception as e:
-            _log_fetch(f"DYN {slug} → EXC {e}")
-            if attempt < 2:
-                time.sleep(0.3)
+    ass_result = [None]
+    dyn_result = [None]
 
-    # Fallback na feed_akcije ako dynamic nije vratio ništa
-    if not dyn_ok and feed_akcije:
+    def fetch_ass():
+        ass_result[0] = _fetch_url(ts, ass_url, f"ASS {slug}", stop_event)
+
+    def fetch_dyn():
+        dyn_result[0] = _fetch_url(ts, dyn_url, f"DYN {slug}", stop_event)
+
+    t_ass = threading.Thread(target=fetch_ass, daemon=True)
+    t_dyn = threading.Thread(target=fetch_dyn, daemon=True)
+    t_ass.start()
+    t_dyn.start()
+    t_ass.join()
+    t_dyn.join()
+
+    # ── Assortment rezultat ───────────────────────────────────────────────────
+    item_popusti = "Ne"
+    ass_data, _ = ass_result[0] or (None, 0)
+    if ass_data:
+        try:
+            if _has_item_discounts(ass_data):
+                item_popusti = "Da"
+        except Exception as e:
+            _log_fetch(f"ASS {slug} → parse EXC {e}")
+
+    # ── Dynamic rezultat ──────────────────────────────────────────────────────
+    akcije_str = "-"
+    dyn_data, _ = dyn_result[0] or (None, 0)
+    if dyn_data:
+        try:
+            parsed   = _parse_dynamic_with_item_discount(dyn_data)
+            combined = list(dict.fromkeys(feed_akcije + parsed))
+            akcije_str = "\n".join(combined) if combined else "-"
+            if akcije_str == "-":
+                _log_fetch(f"DYN {slug} → 200 ali NEMA akcija (parsed={parsed}, feed={feed_akcije})")
+        except Exception as e:
+            _log_fetch(f"DYN {slug} → parse EXC {e}")
+    elif feed_akcije:
         akcije_str = "\n".join(feed_akcije)
-        _log_fetch(f"DYN {slug} → fallback na feed_akcije: {feed_akcije}")
+        _log_fetch(f"DYN {slug} → fallback na feed_akcije")
 
     return slug, akcije_str, item_popusti
 
