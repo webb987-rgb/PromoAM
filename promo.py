@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 60   # povećano sa 10 → 60 (6x brže); ako dobijaš 429, smanji na 40
+FETCH_WORKERS = 10   # povećano sa 10 → 60 (6x brže); ako dobijaš 429, smanji na 40
 
 EMAIL_IGNORE_PROMOS = []  # Nema filtera – prikazujemo SVE akcije
 
