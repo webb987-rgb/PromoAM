@@ -838,12 +838,7 @@ with tab_scan:
             type="secondary",
         )
     with col_info:
-        # Timer prikaz
-        if st.session_state.scan_running and st.session_state.scan_start_time:
-            elapsed = time.time() - st.session_state.scan_start_time
-            m, s = divmod(int(elapsed), 60)
-            st.markdown(f"<div class='timer-box'>⏱️ Skeniranje traje: {m:02d}:{s:02d}</div>", unsafe_allow_html=True)
-        elif st.session_state.last_scan:
+        if st.session_state.last_scan:
             st.info(f"⏱️ Poslednji scan: **{st.session_state.last_scan}** | "
                     f"Ukupno restorana: **{len(st.session_state.df_wolt)}**")
         if not selected_cities:
@@ -867,8 +862,7 @@ with tab_scan:
     # Zaustavljanje
     if stop_scan and st.session_state.scan_running:
         st.session_state.scan_stop_event.set()
-        st.session_state.scan_running = False
-        st.warning("⏹️ Skeniranje zaustavljeno.")
+        st.warning("⏹️ Zaustavljanje... čeka se da threadovi završe.")
 
     # Pokretanje skena
     if run_scan and selected_cities and not st.session_state.scan_running:
@@ -878,31 +872,59 @@ with tab_scan:
         elif "Cookie" in session.headers:
             del session.headers["Cookie"]
 
-        # Reset stop eventa
         st.session_state.scan_stop_event = threading.Event()
         st.session_state.scan_running = True
         st.session_state.scan_start_time = time.time()
+        st.session_state["_scan_result"] = None
+        st.session_state["_scan_done"] = False
 
-        ph = st.empty()
-        stop_ev = st.session_state.scan_stop_event
+        _cities_snap = list(selected_cities)
+        _stop_ev_snap = st.session_state.scan_stop_event
 
-        df = scan_all_cities(selected_cities, ph, stop_ev)
+        def _run_scan_bg():
+            class NullPH:
+                def info(self, *a, **k): pass
+                def warning(self, *a, **k): pass
+                def success(self, *a, **k): pass
+                def error(self, *a, **k): pass
+                def empty(self, *a, **k): pass
+            result = scan_all_cities(_cities_snap, NullPH(), _stop_ev_snap)
+            st.session_state["_scan_result"] = result
+            st.session_state["_scan_done"] = True
+            st.session_state.scan_running = False
 
-        scan_duration = time.time() - st.session_state.scan_start_time
-        st.session_state.scan_running = False
+        bg = threading.Thread(target=_run_scan_bg, daemon=True)
+        bg.start()
+        st.rerun()
 
-        if not df.empty:
-            st.session_state.df_wolt = df
+    # Prikaz statusa dok scan traje
+    if st.session_state.scan_running:
+        elapsed = time.time() - (st.session_state.scan_start_time or time.time())
+        m2, s2 = divmod(int(elapsed), 60)
+        st.info(f"🔄 Skeniranje u toku... **{m2:02d}:{s2:02d}** | Klikni ⏹️ Zaustavi da prekineš.")
+        time.sleep(2)
+        st.rerun()
+
+    # Prikaz rezultata kad scan završi
+    if st.session_state.get("_scan_done"):
+        df_result = st.session_state.get("_scan_result")
+        scan_duration = time.time() - (st.session_state.scan_start_time or time.time())
+        st.session_state["_scan_done"] = False
+        _stop_ev = st.session_state.scan_stop_event
+        if df_result is not None and not df_result.empty:
+            st.session_state.df_wolt = df_result
             st.session_state.last_scan = local_now()
-            save_scan(df)  # Sačuvaj permanentno
+            save_scan(df_result)
             m, s = divmod(int(scan_duration), 60)
+            sa_item = len(df_result[df_result["item_popusti"] == "Da"]) if "item_popusti" in df_result.columns else 0
             st.success(
                 f"✅ Scan završen za **{m:02d}:{s:02d}**! "
-                f"Pronađeno **{len(df)}** restorana, "
-                f"od toga **{len(df[df['akcije'] != '-'])}** sa akcijama."
+                f"Pronađeno **{len(df_result)}** restorana, "
+                f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama, "
+                f"**{sa_item}** sa item popustima."
             )
         else:
-            if stop_ev.is_set():
+            if _stop_ev.is_set():
                 st.warning("⏹️ Scan je zaustavljen pre završetka.")
             else:
                 st.error("❌ Scan nije vratio podatke. Proveri cookie u Debug tabu.")
@@ -911,17 +933,20 @@ with tab_scan:
     if not df.empty:
         st.markdown("---")
 
-        k1, k2, k3, k4 = st.columns(4)
+        k1, k2, k3, k4, k5 = st.columns(5)
         total        = len(df)
         sa_akcijama  = len(df[df["akcije"] != "-"])
+        sa_item_kpi  = len(df[df["item_popusti"] == "Da"]) if "item_popusti" in df.columns else 0
+        bilo_sta     = len(df[(df["akcije"] != "-") | (df.get("item_popusti", pd.Series(dtype=str)) == "Da")])
         otvoreni     = len(df[df["status"] == "Otvoren"])
         novi         = len(df[df["novo"] == "Da"])
 
         for col, val, lbl in [
             (k1, total,       "Ukupno restorana"),
-            (k2, sa_akcijama, "Sa aktivnim akcijama"),
-            (k3, otvoreni,    "Trenutno otvoreno"),
-            (k4, novi,        "Novih restorana"),
+            (k2, bilo_sta,    "Ima akciju (ukupno)"),
+            (k3, sa_akcijama, "Tekstualne akcije"),
+            (k4, sa_item_kpi, "Item popusti 🏷️"),
+            (k5, otvoreni,    "Trenutno otvoreno"),
         ]:
             with col:
                 st.markdown(f"""
@@ -1400,9 +1425,29 @@ with tab_sched:
     st.markdown("---")
     st.markdown("#### 🧪 Test – pokreni ručno odmah")
     st.caption("Radi isto kao automatski sken ali se pokreće odmah. Korisno za testiranje.")
-    if st.button("▶️ Pokreni test sken + slanje sada", key="sched_test"):
-        with st.spinner("Pokrenuo test sken..."):
+
+    sched_running = st.session_state.get("sched_running", False)
+    sched_done    = st.session_state.get("sched_done", False)
+
+    if st.button("▶️ Pokreni test sken + slanje sada", key="sched_test", disabled=sched_running):
+        st.session_state["sched_running"] = True
+        st.session_state["sched_done"]    = False
+
+        def _run_sched_bg():
             run_scheduled_scan_and_send()
+            st.session_state["sched_running"] = False
+            st.session_state["sched_done"]    = True
+
+        threading.Thread(target=_run_sched_bg, daemon=True).start()
+        st.rerun()
+
+    if sched_running:
+        st.info("🔄 Automatski sken u toku... stranica se osvežava svakih 3s.")
+        time.sleep(3)
+        st.rerun()
+
+    if sched_done:
+        st.session_state["sched_done"] = False
         st.success("✅ Test završen. Proveri statistiku i log.")
 
     # Prikaz sledećeg raspoređenog pokretanja
