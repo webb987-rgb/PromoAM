@@ -1455,40 +1455,14 @@ Cookie traje ~24h.
             with st.expander("Pun JSON (dynamic)", expanded=True):
                 st.json(dyn_data)
             st.markdown("**Parsed akcije (full parser):**")
-            parsed = _parse_dynamic_with_item_discount(dyn_data)
+            parsed, ima_item = _parse_dynamic(dyn_data)
             for p in parsed:
                 st.write(p)
             if not parsed:
                 st.warning("Nema parsiranih akcija.")
-            st.markdown(f"**Item discount u dynamic:** `{_dynamic_has_item_discount(dyn_data)}`")
+            st.markdown(f"**Item discount u dynamic:** `{ima_item}`")
         else:
             st.warning(f"Dynamic endpoint nije vratio podatke. HTTP status: {dyn_status}")
-
-        st.markdown("---")
-        st.markdown("#### 2b️⃣ Assortment endpoint (item popusti)")
-        ass_url_dbg = (
-            f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{debug_slug}/assortment"
-        )
-        ass_data, ass_status = wolt_get(ass_url_dbg)
-        if ass_data:
-            items = ass_data.get("items", [])
-            st.write(f"Ukupno artikala: **{len(items)}**")
-            st.write(f"**_has_item_discounts:** `{_has_item_discounts(ass_data)}`")
-            # Prikaži prvih 5 artikala sa svim discount poljima
-            discount_items = []
-            for it in items[:50]:
-                relevant = {k: v for k, v in it.items() if any(x in k.lower() for x in
-                    ["price", "discount", "tag", "original", "compare", "strikethrough", "percent"])}
-                if relevant:
-                    relevant["name"] = it.get("name", "?")
-                    discount_items.append(relevant)
-            if discount_items:
-                with st.expander(f"Artikli sa discount poljima (prvih {len(discount_items[:10])})"):
-                    st.json(discount_items[:10])
-            with st.expander("Pun JSON (assortment)"):
-                st.json(ass_data)
-        else:
-            st.warning(f"Assortment endpoint nije vratio podatke. HTTP status: {ass_status}")
 
         st.markdown("---")
         st.markdown("#### 3️⃣ Promotions endpoint")
