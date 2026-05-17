@@ -1985,7 +1985,34 @@ Cookie traje ~24h.
         st.info(f"Koristim: ključ=`{debug_city_key}`, slug=`{city_slug}`, lat={lat}, lon={lon}")
         st.markdown("---")
 
-        st.markdown("#### 1️⃣ Dynamic endpoint")
+        st.markdown("#### 🛒 Assortment endpoint (meni)")
+        assortment_url = (
+            f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{debug_slug}/assortment"
+        )
+        assortment_data, assortment_status = wolt_get(assortment_url)
+        if assortment_data:
+            items = assortment_data.get("items", [])
+            st.info(f"Ukupno artikala u meniju: **{len(items)}**")
+            snizeni = []
+            for item in items:
+                bp = item.get("base_price")
+                dp = item.get("discounted_price")
+                if bp and dp and isinstance(bp, (int, float)) and isinstance(dp, (int, float)) and dp < bp and bp > 0:
+                    pct = int(round((1 - dp / bp) * 100))
+                    snizeni.append({"naziv": item.get("name",""), "base_price": bp/100, "discounted_price": dp/100, "popust": f"{pct}%"})
+            if snizeni:
+                max_pct = max(int(x["popust"].rstrip("%")) for x in snizeni)
+                st.success(f"✅ {len(snizeni)} sniženih artikala — najveći popust: **{max_pct}%**")
+                st.dataframe(snizeni, use_container_width=True)
+            else:
+                st.warning("❌ Nema artikala sa discounted_price < base_price")
+            st.markdown("**Prvih 5 artikala (sirova polja):**")
+            for item in items[:5]:
+                st.json({"name": item.get("name"), "base_price": item.get("base_price"), "discounted_price": item.get("discounted_price"), "price": item.get("price")})
+        else:
+            st.warning(f"Assortment endpoint nije vratio podatke. HTTP status: {assortment_status}")
+
+        st.markdown("#### 1️⃣ Dynamic endpoint (staro — za referencu)")
         dyn_url = (
             f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{debug_slug}/dynamic/"
             f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
