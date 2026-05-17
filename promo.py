@@ -431,32 +431,34 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
                 time.sleep(0.5)
     return None, -1
 
-def _has_item_discounts(slug: str, ts: requests.Session, stop_event: threading.Event) -> bool:
+def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
     """
-    Poziva Wolt assortment API i proverava da li BILO KOJI artikal ima
-    discounted_price < base_price. Vraća True/False.
+    Šalje JEDAN request na assortment API.
+    Ako bilo koji artikal ima discounted_price < base_price,
+    restoran se označava sa najvećim pronađenim procentom popusta.
     """
     if stop_event.is_set():
-        return False
+        return slug, "-"
 
+    ts = make_thread_session()
     assortment_url = (
         f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
     )
 
     try:
-        time.sleep(random.uniform(0.2, 0.7))
         r = ts.get(assortment_url, timeout=12)
         if r.status_code != 200:
-            _log_fetch(f"ASSORTMENT {slug} → {r.status_code}")
-            return False
+            _log_fetch(f"{slug} → {r.status_code}")
+            return slug, "-"
         data = r.json()
     except Exception as e:
-        _log_fetch(f"ASSORTMENT {slug} → EXC {e}")
-        return False
+        _log_fetch(f"{slug} → EXC {e}")
+        return slug, "-"
 
+    max_pct = 0
     for item in data.get("items", []):
         if stop_event.is_set():
-            return False
+            return slug, "-"
         base_price       = item.get("base_price")
         discounted_price = item.get("discounted_price")
         if (
@@ -467,45 +469,15 @@ def _has_item_discounts(slug: str, ts: requests.Session, stop_event: threading.E
             and base_price > 0
             and discounted_price < base_price
         ):
-            _log_fetch(f"ASSORTMENT {slug} → sniženje pronađeno")
-            return True
+            pct = int(round((1 - discounted_price / base_price) * 100))
+            if pct > max_pct:
+                max_pct = pct
 
-    return False
+    if max_pct > 0:
+        _log_fetch(f"{slug} → sniženje do {max_pct}%")
+        return slug, f"• Sniženje do {max_pct}%"
 
-
-def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
-    if stop_event.is_set():
-        return slug, "-"
-
-    ts = make_thread_session()
-
-    dyn_url = (
-        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
-        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
-    )
-
-    akcije_str = "-"
-    dyn_data, _ = _fetch_url(ts, dyn_url, f"DYN {slug}", stop_event)
-    if dyn_data:
-        try:
-            parsed   = _parse_dynamic_with_item_discount(dyn_data)
-            combined = list(dict.fromkeys(feed_akcije + parsed))
-            akcije_str = "\n".join(combined) if combined else "-"
-            if akcije_str == "-":
-                _log_fetch(f"DYN {slug} → 200 ali NEMA akcija (parsed={parsed}, feed={feed_akcije})")
-        except Exception as e:
-            _log_fetch(f"DYN {slug} → parse EXC {e}")
-    elif feed_akcije:
-        akcije_str = "\n".join(feed_akcije)
-        _log_fetch(f"DYN {slug} → fallback na feed_akcije")
-
-    # ── Provera sniženih artikala (base_price vs discounted_price) ───────────
-    if not stop_event.is_set() and _has_item_discounts(slug, ts, stop_event):
-        existing = akcije_str.split("\n") if akcije_str != "-" else []
-        combined = list(dict.fromkeys(existing + ["• Sniženi artikli u meniju"]))
-        akcije_str = "\n".join(combined)
-
-    return slug, akcije_str
+    return slug, "-"
 
 
 def _parse_dynamic_with_item_discount(data: dict) -> list:
