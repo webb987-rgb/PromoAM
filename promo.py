@@ -28,7 +28,7 @@ CITY_DISPLAY = {
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
 FETCH_WORKERS = 8          # Broj paralelnih threadova
-RATE_LIMIT    = 2.0       # Maksimalan broj requestova u sekundi (globalno)
+RATE_LIMIT    = . 0.5      # Maksimalan broj requestova u sekundi (globalno)
 # Sporiji rate = nema 429 = nema retry zastoja = brže ukupno
 
 EMAIL_IGNORE_PROMOS = [
