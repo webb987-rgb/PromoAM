@@ -27,9 +27,9 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 10          # Broj paralelnih threadova
-FETCH_DELAY   = 0.2       # Pauza između svakog fetch-a (sekunde)
-SUBMIT_DELAY  = 0.1      # Pauza između submitovanja taskova u executor (staggered start)
+FETCH_WORKERS = 8          # Broj paralelnih threadova
+RATE_LIMIT    = 2.0       # Maksimalan broj requestova u sekundi (globalno)
+# Sporiji rate = nema 429 = nema retry zastoja = brže ukupno
 
 EMAIL_IGNORE_PROMOS = [
     # Samo masovne delivery fee akcije koje imaju maltene svi restorani
@@ -280,9 +280,25 @@ def make_thread_session() -> requests.Session:
 
 # Log fajl za debug fetch-a
 _fetch_log_lock = threading.Lock()
+
 # Globalni 429 throttle – kad jedan thread dobije 429, svi čekaju
 _throttle_until = 0.0
 _throttle_lock  = threading.Lock()
+
+# Token bucket rate limiter – kontroliše max req/s globalno
+_token_lock      = threading.Lock()
+_token_last_time = 0.0
+
+def _acquire_token():
+    """Čeka slobodan token pre slanja requesta. Implementira RATE_LIMIT req/s."""
+    global _token_last_time
+    interval = 1.0 / RATE_LIMIT
+    with _token_lock:
+        now  = time.time()
+        wait = _token_last_time + interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _token_last_time = time.time()
 
 def _log_fetch(msg: str):
     try:
@@ -308,38 +324,28 @@ def _set_throttle(seconds: float):
 
 def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
     """
-    Fetches a single URL sa retry logikom.
-    Vraća (response_json_or_None, status_code).
-
-    Staggered start se kontroliše na nivou submitovanja (SUBMIT_DELAY),
-    a FETCH_DELAY dodaje pauzu između pokušaja unutar jednog threada.
+    Fetches a single URL — jedan pokušaj, bez retry.
+    Sporiji RATE_LIMIT = nema 429 = nema zastoja = brže ukupno.
+    Ako ipak dobije 429 — loguje i preskače, ne blokira ostale threadove.
     """
-    for attempt in range(4):
-        if stop_event.is_set():
-            return None, 0
-        _wait_throttle()
-        if attempt > 0:
-            # Između retry-jeva čekamo FETCH_DELAY (ne na prvom pokušaju – to je submit delay)
-            time.sleep(FETCH_DELAY)
-        try:
-            r = ts.get(url, timeout=10)
-            if r.status_code == 200:
-                return r.json(), 200
-            if r.status_code in (401, 403):
-                _log_fetch(f"{label} → {r.status_code} (auth fail)")
-                return None, r.status_code
-            if r.status_code == 429:
-                wait = 2.0 * (2 ** attempt)   # 2s, 4s, 8s, 16s
-                _set_throttle(wait)
-                _log_fetch(f"{label} → 429 retry {attempt} (throttle {wait:.1f}s)")
-                continue
-            _log_fetch(f"{label} → {r.status_code}")
+    if stop_event.is_set():
+        return None, 0
+    _acquire_token()  # rate limit: max RATE_LIMIT req/s globalno
+    try:
+        r = ts.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json(), 200
+        if r.status_code in (401, 403):
+            _log_fetch(f"{label} → {r.status_code} (auth fail)")
             return None, r.status_code
-        except Exception as e:
-            _log_fetch(f"{label} → EXC {e}")
-            if attempt < 3:
-                time.sleep(0.5)
-    return None, -1
+        if r.status_code == 429:
+            _log_fetch(f"{label} → 429 (preskačem — smanji RATE_LIMIT ako se češće javlja)")
+            return None, 429
+        _log_fetch(f"{label} → {r.status_code}")
+        return None, r.status_code
+    except Exception as e:
+        _log_fetch(f"{label} → EXC {e}")
+        return None, -1
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
     if stop_event.is_set():
@@ -644,23 +650,22 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
-        # ── Rate-limited submit: taskovi se submituju sa SUBMIT_DELAY pauzom ──
-        # Ovo sprečava thundering herd (svi threadovi ne kreću odjednom).
-        # Npr. FETCH_WORKERS=3, SUBMIT_DELAY=0.25s → ~4 req/s max burst
-        futures = {}
-        for slug in slugs:
-            if stop_event.is_set():
-                break
-            fut = executor.submit(
+        # ── Token bucket rate limiter ─────────────────────────────────────────
+        # Svi taskovi se submituju odmah, ali svaki thread čeka token pre requesta.
+        # RATE_LIMIT = max req/s globalno. Npr. 4.0 = jedan token svakih 0.25s.
+        # Za razliku od starog SUBMIT_DELAY, ovde threadovi rade paralelno
+        # ali ne šalju više od RATE_LIMIT requestova u sekundi zajedno.
+        futures = {
+            executor.submit(
                 _fetch_one,
                 slug,
                 lat,
                 lon,
                 restaurants[slug]["_feed_akcije"],
                 stop_event,
-            )
-            futures[fut] = slug
-            time.sleep(SUBMIT_DELAY)  # staggered start
+            ): slug
+            for slug in slugs
+        }
 
         for future in as_completed(futures):
             if stop_event.is_set():
