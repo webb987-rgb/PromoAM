@@ -903,15 +903,17 @@ def _should_trigger_scheduler() -> bool:
         if not cfg.get("enabled"):
             return False
 
-        now    = beograd_now()
-        h, m   = cfg["hour"], cfg["minute"]
-        # Okini ako smo u prozoru od 90 sekundi oko zakazanog vremena
+        # Koristimo naive datetime (bez tzinfo) za poređenje
+        now    = beograd_now().replace(tzinfo=None)
+        h, m   = int(cfg["hour"]), int(cfg["minute"])
         target = now.replace(hour=h, minute=m, second=0, microsecond=0)
         diff   = abs((now - target).total_seconds())
+
+        # Okini ako smo u prozoru od 90 sekundi oko zakazanog vremena
         if diff > 90:
             return False
 
-        # Lock fajl: spreči duplo okidanje
+        # Lock fajl: spreči duplo okidanje u istom prozoru
         lock_file = Path("_scheduler_lock.txt")
         if lock_file.exists():
             try:
@@ -922,7 +924,12 @@ def _should_trigger_scheduler() -> bool:
                 pass
         lock_file.write_text(str(time.time()))
         return True
-    except Exception:
+    except Exception as e:
+        # Upiši grešku u log za debug
+        try:
+            Path("_scheduler_debug.txt").write_text(f"trigger error: {e}")
+        except Exception:
+            pass
         return False
 
 # ─────────────────────────── SESSION STATE ───────────────────────────────────
@@ -942,6 +949,7 @@ if "scan_start_time" not in st.session_state:
 if not st.session_state.get("scan_running") and _should_trigger_scheduler():
     cfg_sched = load_scheduler_config()
     st.session_state["_sched_trigger"] = cfg_sched.get("cities", CITIES)
+    st.session_state["_sched_rerun"] = True
 
 # ── Auto-load poslednjeg skena pri prvom pokretanju ──────────────────────
 if "auto_loaded" not in st.session_state:
@@ -1034,9 +1042,9 @@ with tab_scan:
     # ── Auto-pokretanje iz schedulera ────────────────────────────────────────
     sched_trigger_cities = st.session_state.pop("_sched_trigger", None)
     if sched_trigger_cities and not st.session_state.scan_running:
-        run_scan         = True   # reuse iste logike ispod
-        selected_cities  = sched_trigger_cities
-        st.toast("⏰ Automatski sken pokrenuti po rasporedu!", icon="🚀")
+        selected_cities = sched_trigger_cities
+        run_scan        = True
+        st.toast("⏰ Automatski sken pokrenut po rasporedu!", icon="🚀")
 
     # Pokretanje skena
     if run_scan and selected_cities and not st.session_state.scan_running:
