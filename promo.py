@@ -1060,8 +1060,9 @@ with tab_scan:
         st.session_state["_scan_result"] = None
         st.session_state["_scan_done"] = False
 
-        _cities_snap = list(selected_cities)
+        _cities_snap  = list(selected_cities)
         _stop_ev_snap = st.session_state.scan_stop_event
+        _scan_t0      = time.time()  # start time za trajanje
 
         # Očisti stare fajlove pre novog skena
         Path("_scan_done.txt").unlink(missing_ok=True)
@@ -1091,8 +1092,10 @@ with tab_scan:
                 result.to_json("_scan_result.json", orient="records", force_ascii=False)
                 if _is_sched_scan:
                     Path("_scan_send_mail.txt").write_text("1")
-            Path("_scan_done.txt").write_text("1")
-            Path("_scan_status.txt").write_text("✅ Sken završen!")
+            _dur = int(time.time() - _scan_t0)
+            Path("_scan_done.txt").write_text(str(_dur))
+            _dm, _ds = divmod(_dur, 60)
+            Path("_scan_status.txt").write_text(f"✅ Sken završen za {_dm}min {_ds}s!")
 
         bg = threading.Thread(target=_run_scan_bg, daemon=True)
         bg.start()
@@ -1114,6 +1117,12 @@ with tab_scan:
 
     # Prikaz rezultata kad scan završi
     if st.session_state.scan_running and scan_done_flag:
+        try:
+            _dur_sec = int(Path("_scan_done.txt").read_text().strip())
+            _dm, _ds = divmod(_dur_sec, 60)
+            st.toast(f"✅ Skeniranje završeno za {_dm}min {_ds}s!", icon="🏁")
+        except Exception:
+            pass
         Path("_scan_done.txt").unlink(missing_ok=True)
         st.session_state.scan_running = False
         # Ako je bio scheduler sken → automatski pošalji mailove
