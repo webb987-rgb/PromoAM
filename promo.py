@@ -1,4 +1,6 @@
 import re
+import io
+import base64
 import time
 import datetime
 import smtplib
@@ -25,26 +27,53 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 5
+FETCH_WORKERS = 1          # Broj paralelnih threadova
+RATE_LIMIT    = 1.0       # Maksimalan broj requestova u sekundi (globalno)
+# Sporiji rate = nema 429 = nema retry zastoja = brže ukupno
 
 EMAIL_IGNORE_PROMOS = [
+    # Samo masovne delivery fee akcije koje imaju maltene svi restorani
     "0 din delivery fee for 14 days",
     "0 din delivery fee",
-    "400 rsd off on orders over 1,000 rsd",
-    "400 rsd off",
     "free delivery for 14 days",
     "besplatna dostava 14 dana",
     "besplatna dostava",
+    # NE filtriramo: item popuste, basket popuste, % popuste – to su prave akcije
 ]
 
-AMM_FILE   = Path("amm_baza.csv")
 AMM_COLS   = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
-
-ALERT_FILE = Path("alert_log.csv")
 ALERT_COLS = ["timestamp", "city", "restaurant_display", "am_name", "am_email", "akcije"]
 
-# Fajl u kome čuvamo rezultate poslednjeg skena – permanentna baza
-SCAN_FILE  = Path("scan_baza_item.csv")
+# ─────────────────────────── GITHUB INTEGRACIJA ──────────────────────────────
+
+def _gh_headers() -> dict:
+    token = st.secrets["github"]["token"]
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+def _gh_repo() -> str:
+    return st.secrets["github"]["repo"]
+
+def gh_read(path: str) -> tuple:
+    """Čita fajl sa GitHuba. Vraća (sadrzaj, sha) ili (None, None) ako ne postoji."""
+    url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
+    r = requests.get(url, headers=_gh_headers(), timeout=15)
+    if r.status_code == 200:
+        data = r.json()
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        return content, data["sha"]
+    return None, None
+
+def gh_write(path: str, content_str: str, sha, message: str = "update") -> bool:
+    """Upisuje fajl na GitHub (create ili update)."""
+    url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_str.encode("utf-8")).decode("utf-8"),
+    }
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=15)
+    return r.status_code in (200, 201)
 
 # ─────────────────────────── PAGE CONFIG ─────────────────────────────────────
 
@@ -68,8 +97,18 @@ st.markdown("""
 def normalize(name: str) -> str:
     return re.sub(r"[^\w]", "", str(name).lower())
 
+def beograd_now() -> datetime.datetime:
+    """Vraća trenutno vreme u beogradskoj vremenskoj zoni (CET/CEST)."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo("Europe/Belgrade")
+    except Exception:
+        import pytz
+        tz = pytz.timezone("Europe/Belgrade")
+    return datetime.datetime.now(tz)
+
 def local_now() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return beograd_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def display_to_key(display_name: str) -> str:
     for key, disp in CITY_DISPLAY.items():
@@ -96,60 +135,89 @@ def filter_akcije_for_email(akcije_str: str) -> str:
     filtered = [l for l in lines if not is_ignored_promo(l)]
     return "\n".join(filtered) if filtered else "-"
 
-# ─────────────────────────── PERMANENTNA BAZA SKENA ─────────────────────────
+# ─────────────────────────── PERMANENTNA BAZA SKENA (GitHub) ────────────────
 
 def save_scan(df: pd.DataFrame):
-    """Čuva rezultate skena u CSV fajl (permanentna baza)."""
-    df.to_csv(SCAN_FILE, index=False)
+    """Čuva rezultate skena u GitHub (scan_baza_item.json)."""
+    try:
+        json_str = df.to_json(orient="records", force_ascii=False)
+        _, sha = gh_read("scan_baza_item.json")
+        gh_write("scan_baza_item.json", json_str, sha, "scan: update results")
+    except Exception as e:
+        st.warning(f"⚠️ Nije uspelo čuvanje skena na GitHub: {e}")
 
 def load_scan() -> pd.DataFrame:
-    """Učitava prethodni sken iz CSV fajla."""
-    if SCAN_FILE.exists():
-        try:
-            df = pd.read_csv(SCAN_FILE)
-            return df
-        except Exception:
-            return pd.DataFrame()
+    """Učitava prethodni sken sa GitHuba."""
+    try:
+        content, _ = gh_read("scan_baza_item.json")
+        if content and content.strip() and content.strip() != "[]":
+            return pd.read_json(io.StringIO(content), orient="records")
+    except Exception:
+        pass
     return pd.DataFrame()
 
 def scan_meta() -> str:
-    """Vraća datum/vreme poslednjeg sačuvanog skena."""
-    if SCAN_FILE.exists():
-        mtime = SCAN_FILE.stat().st_mtime
-        return datetime.datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
+    """Proverava da li postoji sačuvan sken na GitHubu."""
+    try:
+        url = f"https://api.github.com/repos/{_gh_repo()}/contents/scan_baza_item.json"
+        r = requests.get(url, headers=_gh_headers(), timeout=10)
+        if r.status_code == 200:
+            ts = r.json().get("last_modified") or r.json().get("sha", "")[:7]
+            return ts if ts else "postoji"
+    except Exception:
+        pass
     return None
 
-# ─────────────────────────── AMM BAZA ────────────────────────────────────────
+# ─────────────────────────── AMM BAZA (GitHub) ───────────────────────────────
 
 def load_amm() -> pd.DataFrame:
-    if AMM_FILE.exists():
-        df = pd.read_csv(AMM_FILE)
-        for c in AMM_COLS:
-            if c not in df.columns:
-                df[c] = ""
-        return df
+    try:
+        content, _ = gh_read("amm_baza.csv")
+        if content and content.strip():
+            df = pd.read_csv(io.StringIO(content))
+            for c in AMM_COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df
+    except Exception:
+        pass
     return pd.DataFrame(columns=AMM_COLS)
 
 def save_amm(df: pd.DataFrame):
-    df.to_csv(AMM_FILE, index=False)
+    try:
+        csv_str = df.to_csv(index=False)
+        _, sha = gh_read("amm_baza.csv")
+        ok = gh_write("amm_baza.csv", csv_str, sha, "amm: update baza")
+        if not ok:
+            st.warning("⚠️ Nije uspelo čuvanje AMM baze na GitHub.")
+    except Exception as e:
+        st.warning(f"⚠️ GitHub greška pri čuvanju AMM: {e}")
 
-# ─────────────────────────── ALERT LOG ───────────────────────────────────────
+# ─────────────────────────── ALERT LOG (GitHub) ──────────────────────────────
 
 def load_alert_log() -> pd.DataFrame:
-    if ALERT_FILE.exists():
-        df = pd.read_csv(ALERT_FILE)
-        for c in ALERT_COLS:
-            if c not in df.columns:
-                df[c] = ""
-        return df
+    try:
+        content, _ = gh_read("alert_log.csv")
+        if content and content.strip():
+            df = pd.read_csv(io.StringIO(content))
+            for c in ALERT_COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df
+    except Exception:
+        pass
     return pd.DataFrame(columns=ALERT_COLS)
 
 def append_alert_log(rows: list):
-    df_new = pd.DataFrame(rows)
-    if ALERT_FILE.exists():
-        pd.concat([pd.read_csv(ALERT_FILE), df_new], ignore_index=True).to_csv(ALERT_FILE, index=False)
-    else:
-        df_new.to_csv(ALERT_FILE, index=False)
+    try:
+        existing = load_alert_log()
+        df_new   = pd.DataFrame(rows)
+        merged   = pd.concat([existing, df_new], ignore_index=True)
+        csv_str  = merged.to_csv(index=False)
+        _, sha   = gh_read("alert_log.csv")
+        gh_write("alert_log.csv", csv_str, sha, "alert: append log")
+    except Exception as e:
+        st.warning(f"⚠️ GitHub greška pri čuvanju alert loga: {e}")
 
 # ─────────────────────────── WOLT API & SESSION ──────────────────────────────
 
@@ -197,7 +265,7 @@ def make_thread_session() -> requests.Session:
     s = requests.Session()
     for k, v in session.headers.items():
         s.headers[k] = v
-    # Cookie iz fajla — session_state nije dostupan iz background threada
+    # Čitamo cookie iz fajla jer session_state nije dostupan iz background threada
     try:
         cookie_val = Path("_scan_cookie.txt").read_text().strip()
     except Exception:
@@ -208,116 +276,115 @@ def make_thread_session() -> requests.Session:
         s.headers["Cookie"] = cookie_val
     return s
 
-# ─────────────────────────── LOG SISTEM ──────────────────────────────────────
+# ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
 
-_log_lock = threading.Lock()
+# Log fajl za debug fetch-a
+_fetch_log_lock = threading.Lock()
 
-def _log(msg: str):
-    """Upisuje u debug log fajl sa timestampom."""
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
+# Globalni 429 throttle – kad jedan thread dobije 429, svi čekaju
+_throttle_until = 0.0
+_throttle_lock  = threading.Lock()
+
+# Token bucket rate limiter – kontroliše max req/s globalno
+_token_lock      = threading.Lock()
+_token_last_time = 0.0
+
+def _acquire_token():
+    """Čeka slobodan token pre slanja requesta. Implementira RATE_LIMIT req/s."""
+    global _token_last_time
+    interval = 1.0 / RATE_LIMIT
+    with _token_lock:
+        now  = time.time()
+        wait = _token_last_time + interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _token_last_time = time.time()
+
+def _log_fetch(msg: str):
     try:
-        with _log_lock:
+        with _fetch_log_lock:
             with open("_fetch_debug.log", "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+                f.write(msg + "\n")
     except Exception:
         pass
 
-# Globalni brojač requestova za throttle
-_req_lock  = threading.Lock()
-_req_times = []   # timestamps poslednjih requestova
+def _wait_throttle():
+    """Čeka ako je globalni throttle aktivan."""
+    now = time.time()
+    with _throttle_lock:
+        wait = _throttle_until - now
+    if wait > 0:
+        time.sleep(wait)
 
-def _get_max_rps() -> float:
-    """Vraća max req/s — iz testa ako postoji, inače default 3.0."""
+def _set_throttle(seconds: float):
+    """Postavlja globalni throttle za sve threadove."""
+    with _throttle_lock:
+        global _throttle_until
+        _throttle_until = max(_throttle_until, time.time() + seconds)
+
+def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
+    """
+    Fetches a single URL — jedan pokušaj, bez retry.
+    Sporiji RATE_LIMIT = nema 429 = nema zastoja = brže ukupno.
+    Ako ipak dobije 429 — loguje i preskače, ne blokira ostale threadove.
+    """
+    if stop_event.is_set():
+        return None, 0
+    _acquire_token()  # rate limit: max RATE_LIMIT req/s globalno
     try:
-        # Pokušaj da pročita iz fajla (thread-safe, radi i iz background threada)
-        val = float(Path("_auto_rps.txt").read_text().strip())
-        return val if 0.5 <= val <= 20.0 else 3.0
-    except Exception:
-        return 3.0
-
-def _throttle_request():
-    """
-    Osigurava max N req/s globalno (across all threads).
-    N se čita iz _auto_rps.txt ako je test pokrenut, inače 3.0.
-    """
-    MAX_RPS = _get_max_rps()
-    global _req_times
-    while True:
-        now = time.time()
-        with _req_lock:
-            _req_times = [t for t in _req_times if now - t < 1.0]
-            if len(_req_times) < MAX_RPS:
-                _req_times.append(now)
-                break
-        time.sleep(0.02)
-
-# ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
+        r = ts.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json(), 200
+        if r.status_code in (401, 403):
+            _log_fetch(f"{label} → {r.status_code} (auth fail)")
+            return None, r.status_code
+        if r.status_code == 429:
+            _log_fetch(f"{label} → 429 (preskačem — smanji RATE_LIMIT ako se češće javlja)")
+            return None, 429
+        _log_fetch(f"{label} → {r.status_code}")
+        return None, r.status_code
+    except Exception as e:
+        _log_fetch(f"{label} → EXC {e}")
+        return None, -1
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
-    """Samo dynamic endpoint sa rate limitom i logom."""
     if stop_event.is_set():
         return slug, "-"
 
     ts = make_thread_session()
+
     dyn_url = (
         f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
 
-    for attempt in range(3):
-        if stop_event.is_set():
-            break
-
-        _throttle_request()   # max 3 req/s globalno
-
+    akcije_str = "-"
+    dyn_data, _ = _fetch_url(ts, dyn_url, f"DYN {slug}", stop_event)
+    if dyn_data:
         try:
-            r = ts.get(dyn_url, timeout=10)
-
-            if r.status_code == 200:
-                try:
-                    parsed   = _parse_dynamic_with_item_discount(r.json())
-                    combined = list(dict.fromkeys(feed_akcije + parsed))
-                    return slug, "\n".join(combined) if combined else "-"
-                except Exception as e:
-                    _log(f"PARSE ERR {slug}: {e}")
-                    break
-
-            elif r.status_code == 429:
-                wait = 5 + attempt * 5 + random.uniform(0, 2)
-                _log(f"429 {slug} → čekam {wait:.1f}s (pokušaj {attempt+1}/3)")
-                time.sleep(wait)
-                continue
-
-            elif r.status_code in (401, 403):
-                _log(f"AUTH {r.status_code} {slug} → cookie istekao!")
-                break
-
-            else:
-                _log(f"HTTP {r.status_code} {slug}")
-                break
-
-        except requests.exceptions.Timeout:
-            _log(f"TIMEOUT {slug} (pokušaj {attempt+1}/3)")
-            if attempt < 2:
-                time.sleep(1)
-            continue
-
+            parsed   = _parse_dynamic_with_item_discount(dyn_data)
+            combined = list(dict.fromkeys(feed_akcije + parsed))
+            akcije_str = "\n".join(combined) if combined else "-"
+            if akcije_str == "-":
+                _log_fetch(f"DYN {slug} → 200 ali NEMA akcija (parsed={parsed}, feed={feed_akcije})")
         except Exception as e:
-            _log(f"EXC {slug}: {type(e).__name__}: {e}")
-            if attempt < 2:
-                time.sleep(0.5)
-            continue
+            _log_fetch(f"DYN {slug} → parse EXC {e}")
+    elif feed_akcije:
+        akcije_str = "\n".join(feed_akcije)
+        _log_fetch(f"DYN {slug} → fallback na feed_akcije")
 
-    if feed_akcije:
-        return slug, "\n".join(feed_akcije)
-    return slug, "-"
+    return slug, akcije_str
 
 
 def _parse_dynamic_with_item_discount(data: dict) -> list:
     """
-    Proširena verzija _parse_dynamic koja parsira i item_discount efekte
-    iz venue_raw.discounts[].effects.item_discount.
+    Parsira SVE vrste popusta iz dynamic endpointa:
+    - item_discount  (popust na izabrane artikle, npr. "10% off selected items")
+    - basket_discount (popust na celu korpu, npr. "400 RSD off")
+    - delivery_discount (besplatna dostava)
+    - free_items (gratis proizvodi)
+    Tekst se uzima iz bannera / description / offer_trackers.
+    Ako tekst nije dostupan, generiše se opisni string iz vrednosti efekta.
     """
     akcije = []
     seen = set()
@@ -344,30 +411,61 @@ def _parse_dynamic_with_item_discount(data: dict) -> list:
     for disc in venue_raw.get("discounts", []):
         if not isinstance(disc, dict):
             continue
-        is_wp = disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False)
+        is_wp = (disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False) or (disc.get("conditions") or {}).get("has_wolt_plus") == True)
 
-        # Banner tekst
         banner = disc.get("banner") or {}
-        add(banner.get("formatted_text"), wolt_plus=is_wp)
+        desc   = disc.get("description") or {}
 
-        # Description title
-        desc = disc.get("description") or {}
-        add(desc.get("title"), wolt_plus=is_wp)
+        # Uzimamo tekst iz bannera ili opisa (primarni izvor)
+        primary_text = banner.get("formatted_text") or desc.get("title") or ""
+        add(primary_text, wolt_plus=is_wp)
 
-        # ── item_discount efekat ──────────────────────────────────────────────
+        # ── Svi efekti – fallback tekst ako nema primarnog ───────────────────
         effects = disc.get("effects") or {}
+
+        # item_discount – popust na konkretne artikle
         item_disc = effects.get("item_discount")
         if item_disc and isinstance(item_disc, dict):
             fraction = item_disc.get("fraction")
             if fraction and float(fraction) > 0:
                 pct = int(round(float(fraction) * 100))
-                # Pokušaj da nađemo naziv kampanje iz opisa ili bannera
-                promo_name = desc.get("title") or banner.get("formatted_text") or ""
-                if promo_name:
-                    add(promo_name, wolt_plus=is_wp)
-                else:
-                    add(f"{pct}% popust na izabrane artikle", wolt_plus=is_wp)
+                fallback = primary_text or f"{pct}% popust na izabrane artikle"
+                add(fallback, wolt_plus=is_wp)
 
+        # basket_discount – popust na celu korpu (fiksni iznos ili %)
+        basket_disc = effects.get("basket_discount")
+        if basket_disc and isinstance(basket_disc, dict):
+            amount   = basket_disc.get("amount")
+            fraction = basket_disc.get("fraction")
+            if amount and int(amount) > 0:
+                rsd = int(amount) // 100
+                fallback = primary_text or f"{rsd} RSD popust na korpu"
+                add(fallback, wolt_plus=is_wp)
+            elif fraction and float(fraction) > 0:
+                pct = int(round(float(fraction) * 100))
+                fallback = primary_text or f"{pct}% popust na celu korpu"
+                add(fallback, wolt_plus=is_wp)
+
+        # delivery_discount – popust na dostavu / besplatna dostava
+        delivery_disc = effects.get("delivery_discount")
+        if delivery_disc and isinstance(delivery_disc, dict):
+            amount   = delivery_disc.get("amount")
+            fraction = delivery_disc.get("fraction")
+            if (amount is not None and int(amount) == 0) or (fraction and float(fraction) >= 1.0):
+                fallback = primary_text or "Besplatna dostava"
+                add(fallback, wolt_plus=is_wp)
+            elif amount and int(amount) > 0:
+                rsd = int(amount) // 100
+                fallback = primary_text or f"{rsd} RSD popust na dostavu"
+                add(fallback, wolt_plus=is_wp)
+
+        # free_items – gratis artikli
+        free_items = effects.get("free_items")
+        if free_items and isinstance(free_items, (dict, list)):
+            fallback = primary_text or "Gratis artikal uz porudžbinu"
+            add(fallback, wolt_plus=is_wp)
+
+    # venue.banners – banneri prikazani na stranici restorana
     venue = data.get("venue") or {}
     for ban in venue.get("banners", []):
         if not isinstance(ban, dict):
@@ -376,6 +474,7 @@ def _parse_dynamic_with_item_discount(data: dict) -> list:
         disc = ban.get("discount") or {}
         add(disc.get("formatted_text"), wolt_plus=is_wp)
 
+    # offer_trackers – progress bar tracker u UI-u
     offer_assistant = venue.get("offer_assistant") or {}
     for tracker in offer_assistant.get("offer_trackers", []):
         if not isinstance(tracker, dict):
@@ -405,7 +504,7 @@ def _parse_dynamic(data: dict) -> list:
     for disc in venue_raw.get("discounts", []):
         if not isinstance(disc, dict):
             continue
-        is_wp = disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False)
+        is_wp = (disc.get("has_wolt_plus") or (disc.get("banner") or {}).get("show_wolt_plus", False) or (disc.get("conditions") or {}).get("has_wolt_plus") == True)
         banner = disc.get("banner") or {}
         add(banner.get("formatted_text"), wolt_plus=is_wp)
         desc = disc.get("description") or {}
@@ -429,15 +528,21 @@ def _parse_dynamic(data: dict) -> list:
     return list(akcije)
 
 
+def _safe_price(val) -> float:
+    """Sigurno izvlači cenu – ignoruje dict/None vrednosti."""
+    if isinstance(val, (int, float)):
+        return float(val) / 100
+    return 0.0
+
 def _has_item_discounts(data: dict) -> bool:
     for item in data.get("items", []):
-        price = (item.get("base_price") or item.get("price") or 0) / 100
-        orig = (
+        price = _safe_price(item.get("base_price") or item.get("price") or 0)
+        orig  = _safe_price(
             item.get("original_price") or
             item.get("strikethrough_price") or
             item.get("compare_at_price") or
             item.get("unit_price") or 0
-        ) / 100
+        )
         if orig > 0 and orig > price:
             return True
     return False
@@ -514,7 +619,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                         "dostava":      delivery,
                         "novo":         novo_status,
                         "_feed_akcije": feed_akcije,
-                        "item_popusti": "Ne",
+                        
                         "akcije":       "-",
                         "link":         f"https://wolt.com/en/srb/{city_slug}/restaurant/{slug}",
                         "naziv_norm":   normalize(name),
@@ -530,7 +635,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
             break  # nema više stranica
 
         skip += 40
-        time.sleep(0.2)
+        time.sleep(0.1)  # 0.2 → 0.1: paginacija je retka, može brže
 
     if not restaurants or stop_event.is_set():
         if not restaurants:
@@ -540,11 +645,16 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     # ── Paralelno fetchovanje akcija ──────────────────────────────────────────
     slugs = list(restaurants.keys())
     total = len(slugs)
-    progress_text = f"⚡ Učitavam akcije za {city_display} ({total} restorana)..."
-    progress_bar = st.progress(0, text=progress_text)
     completed = 0
 
+    status_placeholder.info(f"⚡ Učitavam akcije za **{city_display}** ({total} restorana)...")
+
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        # ── Token bucket rate limiter ─────────────────────────────────────────
+        # Svi taskovi se submituju odmah, ali svaki thread čeka token pre requesta.
+        # RATE_LIMIT = max req/s globalno. Npr. 4.0 = jedan token svakih 0.25s.
+        # Za razliku od starog SUBMIT_DELAY, ovde threadovi rade paralelno
+        # ali ne šalju više od RATE_LIMIT requestova u sekundi zajedno.
         futures = {
             executor.submit(
                 _fetch_one,
@@ -568,13 +678,10 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 pass
 
             completed += 1
-            if completed % 5 == 0 or completed == total:
-                progress_bar.progress(
-                    min(completed / total, 1.0),
-                    text=f"⚡ {city_display}: {completed}/{total} restorana obrađeno..."
+            if completed % 10 == 0 or completed == total:
+                status_placeholder.info(
+                    f"⚡ **{city_display}**: {completed}/{total} restorana obrađeno..."
                 )
-
-    progress_bar.empty()
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
@@ -582,23 +689,65 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     return list(restaurants.values())
 
 
+def _write_city_status(all_cities: list, city_states: dict):
+    """Upisuje per-grad status u JSON fajl koji UI čita."""
+    import json
+    Path("_scan_city_status.json").write_text(
+        json.dumps({"cities": all_cities, "states": city_states}, ensure_ascii=False)
+    )
+
 def scan_all_cities(selected_cities: list[str], status_placeholder, stop_event: threading.Event) -> pd.DataFrame:
-    all_rows = []
+    import json
+    all_rows    = []
+    city_states = {c: {"status": "⏳ čeka...", "done": 0, "total": 0} for c in selected_cities}
+    _write_city_status(selected_cities, city_states)
+
     for i, city in enumerate(selected_cities):
         if stop_event.is_set():
             break
+
+        city_states[city]["status"] = "🔍 učitavam listu..."
+        _write_city_status(selected_cities, city_states)
+
+        # Wrapper koji ažurira per-grad status
+        class CityPH:
+            def __init__(self, city_name):
+                self.city = city_name
+            def _update(self, msg):
+                # Izvuci progress ako postoji (npr. "90/1689")
+                import re
+                m = re.search(r"(\d+)/(\d+)", str(msg))
+                if m:
+                    city_states[self.city]["done"]  = int(m.group(1))
+                    city_states[self.city]["total"] = int(m.group(2))
+                city_states[self.city]["status"] = str(msg)
+                _write_city_status(selected_cities, city_states)
+                status_placeholder.info(str(msg))
+            def info(self, msg, *a, **k):    self._update(msg)
+            def warning(self, msg, *a, **k): self._update(f"⚠️ {msg}")
+            def success(self, msg, *a, **k): self._update(msg)
+            def error(self, msg, *a, **k):   self._update(f"❌ {msg}")
+            def empty(self, *a, **k):        pass
+
         try:
-            rows = fetch_city(city, status_placeholder, stop_event)
+            rows = fetch_city(city, CityPH(city), stop_event)
             all_rows.extend(rows)
             if not stop_event.is_set():
-                status_placeholder.success(f"✅ {city} završen! ({len(rows)} restorana)")
+                city_states[city]["status"] = f"✅ završen ({len(rows)} restorana)"
+                city_states[city]["done"]   = len(rows)
+                city_states[city]["total"]  = len(rows)
+                _write_city_status(selected_cities, city_states)
         except Exception as e:
-            status_placeholder.error(f"❌ Greška za {city}: {e}")
+            city_states[city]["status"] = f"❌ greška: {e}"
+            _write_city_status(selected_cities, city_states)
             import traceback
             st.error(traceback.format_exc())
+
         if i < len(selected_cities) - 1 and not stop_event.is_set():
             time.sleep(0.5)
+
     status_placeholder.empty()
+    Path("_scan_city_status.json").unlink(missing_ok=True)
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
 # ─────────────────────────── EMAIL ───────────────────────────────────────────
@@ -617,13 +766,6 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
 
             # Item popust badge ide U kolonu Akcije, ne uz naziv
             item_badge = ""
-            if a.get("item_popusti") == "Da":
-                item_badge = (
-                    "<div style='margin-top:6px'>"
-                    "<span style='background:#fff3cd;color:#856404;padding:2px 8px;"
-                    "border-radius:12px;font-size:11px;font-weight:700'>🏷️ ITEM POPUSTI</span>"
-                    "</div>"
-                )
 
             # Akcije tekst
             if akcije_filtered != "-":
@@ -650,7 +792,7 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
         if not rows_html:
             return True
 
-        today_str = datetime.date.today().strftime("%d.%m.%Y")
+        today_str = beograd_now().strftime("%d.%m.%Y")
 
         html = f"""
         <html><body style='font-family:Arial,sans-serif;color:#222;max-width:720px;margin:auto'>
@@ -694,20 +836,24 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
 
 # ─────────────────────────── AUTO-SCHEDULER ──────────────────────────────────
 
-SCHEDULER_FILE = Path("scheduler_config.json")
-
 def load_scheduler_config() -> dict:
     import json
-    if SCHEDULER_FILE.exists():
-        try:
-            return json.loads(SCHEDULER_FILE.read_text())
-        except Exception:
-            pass
+    try:
+        content, _ = gh_read("scheduler_config.json")
+        if content:
+            return json.loads(content)
+    except Exception:
+        pass
     return {"enabled": False, "hour": 8, "minute": 0, "cities": CITIES}
 
 def save_scheduler_config(cfg: dict):
     import json
-    SCHEDULER_FILE.write_text(json.dumps(cfg))
+    try:
+        cfg_str = json.dumps(cfg)
+        _, sha  = gh_read("scheduler_config.json")
+        gh_write("scheduler_config.json", cfg_str, sha, "scheduler: update config")
+    except Exception as e:
+        st.warning(f"⚠️ GitHub greška pri čuvanju scheduler config: {e}")
 
 def run_scheduled_scan_and_send():
     """
@@ -758,7 +904,7 @@ def run_scheduled_scan_and_send():
 
     def should_alert(row):
         filtered = filter_akcije_for_email(row["akcije"])
-        return filtered != "-" or row.get("item_popusti") == "Da"
+        return filtered != "-"
 
     merged["_alert"] = merged.apply(should_alert, axis=1)
     sa_akcijama = merged[merged["_alert"]].copy()
@@ -770,7 +916,7 @@ def run_scheduled_scan_and_send():
                 "naziv":        row["naziv"],
                 "grad":         row["grad"],
                 "akcije":       row["akcije"],
-                "item_popusti": row.get("item_popusti", "Ne"),
+
                 "link":         row.get("link", ""),
             }
             for _, row in grp.iterrows()
@@ -793,30 +939,45 @@ def run_scheduled_scan_and_send():
     log.info(f"[Scheduler] Završeno. Poslato mailova: {len(sent_log)}")
 
 
-def _scheduler_loop():
-    """Stalni pozadinski thread koji čeka pravo vreme i pali sken."""
-    import logging
-    log = logging.getLogger("scheduler")
-    while True:
+def _should_trigger_scheduler() -> bool:
+    """
+    Proverava da li je vreme za automatski sken.
+    Poziva se pri svakom rerun (svake sekunde iz countdown-a).
+    Koristi lock fajl da spreči duplo okidanje.
+    """
+    try:
         cfg = load_scheduler_config()
-        if cfg.get("enabled"):
-            now = datetime.datetime.now()
-            target = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
-            if now >= target:
-                target += datetime.timedelta(days=1)
-            wait_sec = (target - now).total_seconds()
-            log.info(f"[Scheduler] Sledeći sken za {wait_sec/3600:.1f}h")
-            time.sleep(wait_sec)
-            run_scheduled_scan_and_send()
-        else:
-            time.sleep(60)  # Proveri ponovo za minutu
+        if not cfg.get("enabled"):
+            return False
 
+        # Koristimo naive datetime (bez tzinfo) za poređenje
+        now    = beograd_now().replace(tzinfo=None)
+        h, m   = int(cfg["hour"]), int(cfg["minute"])
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        diff   = abs((now - target).total_seconds())
 
-# Pokretanje scheduler threada jednom po sesiji
-if "scheduler_started" not in st.session_state:
-    t = threading.Thread(target=_scheduler_loop, daemon=True)
-    t.start()
-    st.session_state["scheduler_started"] = True
+        # Okini ako smo u prozoru od 90 sekundi oko zakazanog vremena
+        if diff > 90:
+            return False
+
+        # Lock fajl: spreči duplo okidanje u istom prozoru
+        lock_file = Path("_scheduler_lock.txt")
+        if lock_file.exists():
+            try:
+                lock_ts = float(lock_file.read_text().strip())
+                if time.time() - lock_ts < 300:  # već okidan u poslednjih 5min
+                    return False
+            except Exception:
+                pass
+        lock_file.write_text(str(time.time()))
+        return True
+    except Exception as e:
+        # Upiši grešku u log za debug
+        try:
+            Path("_scheduler_debug.txt").write_text(f"trigger error: {e}")
+        except Exception:
+            pass
+        return False
 
 # ─────────────────────────── SESSION STATE ───────────────────────────────────
 
@@ -831,7 +992,33 @@ if "scan_running" not in st.session_state:
 if "scan_start_time" not in st.session_state:
     st.session_state.scan_start_time = None
 
+# ── Auto-trigger scheduler ako je vreme ──────────────────────────────────
+if not st.session_state.get("scan_running") and _should_trigger_scheduler():
+    cfg_sched = load_scheduler_config()
+    st.session_state["_sched_trigger"] = cfg_sched.get("cities", CITIES)
+    st.session_state["_sched_rerun"] = True
+
+# ── Auto-load poslednjeg skena pri prvom pokretanju ──────────────────────
+if "auto_loaded" not in st.session_state:
+    st.session_state["auto_loaded"] = True
+    try:
+        prev_df = load_scan()
+        if not prev_df.empty:
+            st.session_state.df_wolt = prev_df
+            st.session_state.last_scan = "GitHub (auto-učitan)"
+    except Exception:
+        pass
+
 # ─────────────────────────── UI ──────────────────────────────────────────────
+
+# ── Anti-sleep: skripta sama sebe pinguje da Streamlit Cloud ne zaspi ────
+# Streamlit Cloud uspava app posle ~15min neaktivnosti.
+# Ovaj kod ubacuje nevidljivi iframe koji osvežava stranicu svakih 10 minuta.
+st.markdown(
+    '<iframe src="javascript:setInterval(function(){fetch(window.location.href)},600000)" '
+    'style="display:none"></iframe>',
+    unsafe_allow_html=True,
+)
 
 st.title("🏷️ Promo Monitor – Item Level")
 st.caption("Skenira item-level popuste: ulazi u svaki restoran i proverava da li ima makar jedan snižen proizvod. Nema dynamic akcija – samo čisto item skeniranje.")
@@ -899,6 +1086,13 @@ with tab_scan:
         st.session_state.scan_stop_event.set()
         st.warning("⏹️ Zaustavljanje... čeka se da threadovi završe.")
 
+    # ── Auto-pokretanje iz schedulera ────────────────────────────────────────
+    sched_trigger_cities = st.session_state.pop("_sched_trigger", None)
+    if sched_trigger_cities and not st.session_state.scan_running:
+        selected_cities = sched_trigger_cities
+        run_scan        = True
+        st.toast("⏰ Automatski sken pokrenut po rasporedu!", icon="🚀")
+
     # Pokretanje skena
     if run_scan and selected_cities and not st.session_state.scan_running:
         cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
@@ -910,30 +1104,45 @@ with tab_scan:
         st.session_state.scan_stop_event = threading.Event()
         st.session_state.scan_running = True
         st.session_state.scan_start_time = time.time()
+        st.session_state["_scan_result"] = None
+        st.session_state["_scan_done"] = False
 
         _cities_snap  = list(selected_cities)
         _stop_ev_snap = st.session_state.scan_stop_event
+        _scan_t0      = time.time()  # start time za trajanje
 
-        # Očisti stare fajlove
+        # Očisti stare fajlove pre novog skena
         Path("_scan_done.txt").unlink(missing_ok=True)
-        Path("_scan_result.json").unlink(missing_ok=True)
+        Path("_scan_result.csv").unlink(missing_ok=True)
         Path("_scan_status.txt").write_text("🔄 Priprema skena...")
-        Path("_fetch_debug.log").unlink(missing_ok=True)  # briši stari log
-        # Snimi cookie u fajl — threadovi ne vide session_state
-        Path("_scan_cookie.txt").write_text(cookie or "")
+
+        # Capture cookie u glavnom threadu i sačuvaj u fajl da thread može da ga čita
+        _cookie_snap = st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or ""
+        Path("_scan_cookie.txt").write_text(_cookie_snap)
+
+        _is_sched_scan = bool(sched_trigger_cities)
 
         def _run_scan_bg():
             class LivePH:
-                def info(self, msg, *a, **k):    Path("_scan_status.txt").write_text(str(msg))
-                def warning(self, msg, *a, **k): Path("_scan_status.txt").write_text("⚠️ " + str(msg))
-                def success(self, msg, *a, **k): Path("_scan_status.txt").write_text("✅ " + str(msg))
-                def error(self, msg, *a, **k):   Path("_scan_status.txt").write_text("❌ " + str(msg))
-                def empty(self, *a, **k): pass
+                def info(self, msg, *a, **k):
+                    Path("_scan_status.txt").write_text(str(msg))
+                def warning(self, msg, *a, **k):
+                    Path("_scan_status.txt").write_text("⚠️ " + str(msg))
+                def success(self, msg, *a, **k):
+                    Path("_scan_status.txt").write_text("✅ " + str(msg))
+                def error(self, msg, *a, **k):
+                    Path("_scan_status.txt").write_text("❌ " + str(msg))
+                def empty(self, *a, **k):
+                    pass
             result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
             if result is not None and not result.empty:
                 result.to_json("_scan_result.json", orient="records", force_ascii=False)
-            Path("_scan_done.txt").write_text("1")
-            Path("_scan_status.txt").write_text("✅ Sken završen!")
+                if _is_sched_scan:
+                    Path("_scan_send_mail.txt").write_text("1")
+            _dur = int(time.time() - _scan_t0)
+            Path("_scan_done.txt").write_text(str(_dur))
+            _dm, _ds = divmod(_dur, 60)
+            Path("_scan_status.txt").write_text(f"✅ Sken završen za {_dm}min {_ds}s!")
 
         bg = threading.Thread(target=_run_scan_bg, daemon=True)
         bg.start()
@@ -941,36 +1150,80 @@ with tab_scan:
 
     # Prikaz statusa dok scan traje
     scan_done_flag = Path("_scan_done.txt").exists()
+
     if st.session_state.scan_running and not scan_done_flag:
+        import json
         elapsed = time.time() - (st.session_state.scan_start_time or time.time())
-        m2, s2 = divmod(int(elapsed), 60)
+        m2, s2  = divmod(int(elapsed), 60)
+
+        st.markdown(f"**🔄 Skeniranje u toku — {m2:02d}:{s2:02d}**")
+
+        # Per-grad status tabela
         try:
-            status_msg = Path("_scan_status.txt").read_text()
+            city_data = json.loads(Path("_scan_city_status.json").read_text())
+            cities    = city_data.get("cities", [])
+            states    = city_data.get("states", {})
+            for c in cities:
+                st_info = states.get(c, {})
+                done    = st_info.get("done", 0)
+                total   = st_info.get("total", 0)
+                status  = st_info.get("status", "⏳ čeka...")
+                # Progres bar po gradu
+                pct = (done / total) if total > 0 else 0.0
+                col_name, col_bar, col_cnt = st.columns([2, 5, 2])
+                with col_name:
+                    st.markdown(f"**{c}**")
+                with col_bar:
+                    st.progress(min(pct, 1.0))
+                with col_cnt:
+                    if total > 0:
+                        st.markdown(f"`{done}/{total}`")
+                    else:
+                        st.markdown(f"`{status[:30]}`")
         except Exception:
-            status_msg = "🔄 Skeniranje..."
-        st.info(f"🔄 **{m2:02d}:{s2:02d}** | {status_msg}")
-        time.sleep(2)
+            try:
+                status_msg = Path("_scan_status.txt").read_text()
+            except Exception:
+                status_msg = "🔄 Skeniranje..."
+            st.info(status_msg)
+
+        time.sleep(1)
         st.rerun()
 
     # Prikaz rezultata kad scan završi
-    if st.session_state.scan_running and Path("_scan_done.txt").exists():
+    if st.session_state.scan_running and scan_done_flag:
+        try:
+            _dur_sec = int(Path("_scan_done.txt").read_text().strip())
+            _dm, _ds = divmod(_dur_sec, 60)
+            st.toast(f"✅ Skeniranje završeno za {_dm}min {_ds}s!", icon="🏁")
+        except Exception:
+            pass
         Path("_scan_done.txt").unlink(missing_ok=True)
         st.session_state.scan_running = False
+        # Ako je bio scheduler sken → automatski pošalji mailove
+        if Path("_scan_send_mail.txt").exists():
+            Path("_scan_send_mail.txt").unlink(missing_ok=True)
+            threading.Thread(target=run_scheduled_scan_and_send, daemon=True).start()
+            st.toast("📧 Slanje alertova AM-ovima u toku...", icon="📬")
         scan_duration = time.time() - (st.session_state.scan_start_time or time.time())
         _stop_ev = st.session_state.scan_stop_event
+
         try:
             df_result = pd.read_json("_scan_result.json", orient="records")
         except Exception:
             df_result = pd.DataFrame()
+
         if df_result is not None and not df_result.empty:
             st.session_state.df_wolt = df_result
             st.session_state.last_scan = local_now()
             save_scan(df_result)
             m, s = divmod(int(scan_duration), 60)
+            sa_item = 0
             st.success(
                 f"✅ Scan završen za **{m:02d}:{s:02d}**! "
                 f"Pronađeno **{len(df_result)}** restorana, "
-                f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama."
+                f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama, "
+                f"**{sa_item}** sa item popustima."
             )
             st.rerun()
         else:
@@ -986,8 +1239,8 @@ with tab_scan:
         k1, k2, k3, k4, k5 = st.columns(5)
         total        = len(df)
         sa_akcijama  = len(df[df["akcije"] != "-"])
-        sa_item_kpi  = len(df[df["item_popusti"] == "Da"]) if "item_popusti" in df.columns else 0
-        bilo_sta     = len(df[(df["akcije"] != "-") | (df.get("item_popusti", pd.Series(dtype=str)) == "Da")])
+        sa_item_kpi  = 0
+        bilo_sta     = len(df[df["akcije"] != "-"])
         otvoreni     = len(df[df["status"] == "Otvoren"])
         novi         = len(df[df["novo"] == "Da"])
 
@@ -1050,14 +1303,12 @@ with tab_scan:
                 lambda cell: any(a in cell for a in akcija_filter) if cell != "-" else False
             )
             fdf = fdf[mask]
-        if samo_item_pop and "item_popusti" in fdf.columns:
-            fdf = fdf[fdf["item_popusti"] == "Da"]
         if samo_wolt_plus:
             fdf = fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)]
 
         total_fdf = len(fdf)
         sa_ak     = len(fdf[fdf["akcije"] != "-"])
-        sa_item   = len(fdf[fdf["item_popusti"] == "Da"]) if "item_popusti" in fdf.columns else 0
+        sa_item   = 0
         sa_wplus  = len(fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)])
         sa_novi_f = len(fdf[fdf["novo"] == "Da"])
         sa_otv    = len(fdf[fdf["status"] == "Otvoren"])
@@ -1079,7 +1330,7 @@ with tab_scan:
                 </div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
-        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "item_popusti", "akcije", "link"]
+        display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "akcije", "link"]
         display_cols = [c for c in display_cols if c in fdf.columns]
 
         st.dataframe(
@@ -1094,7 +1345,6 @@ with tab_scan:
                 "ocena":        st.column_config.TextColumn("Ocena"),
                 "dostava":      st.column_config.TextColumn("Dostava"),
                 "novo":         st.column_config.TextColumn("Novi"),
-                "item_popusti": st.column_config.TextColumn("🏷️ Item pop."),
                 "akcije":       st.column_config.TextColumn("Akcije", width="large"),
                 "link":         st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
             },
@@ -1258,8 +1508,7 @@ with tab_alert:
         def should_alert(row):
             filtered = filter_akcije_for_email(row["akcije"])
             has_real_promo   = filtered != "-"
-            has_item_popusti = row.get("item_popusti") == "Da"
-            return has_real_promo or has_item_popusti
+            return has_real_promo
 
         merged["_alert"] = merged.apply(should_alert, axis=1)
         sa_akcijama = merged[merged["_alert"]].copy()
@@ -1288,7 +1537,7 @@ with tab_alert:
             st.caption(
                 f"Partnera za alert: **{len(preview)}** | "
                 f"AM-ova: **{preview['am_name'].nunique()}** | "
-                f"Sa item popustima: **{len(preview[preview['item_popusti']=='Da'])}**"
+                f"Ukupno akcija: **{len(preview[preview['akcije_email'] != '-'])}**"
             )
 
             # Preview kolone – bez posebne item_popusti kolone (sve je u akcije_email)
@@ -1330,7 +1579,7 @@ with tab_alert:
                             "naziv":        row["naziv"],
                             "grad":         row["grad"],
                             "akcije":       row["akcije"],
-                            "item_popusti": row.get("item_popusti", "Ne"),
+
                             "link":         row.get("link", ""),
                         }
                         for _, row in grp.iterrows()
@@ -1500,20 +1749,46 @@ with tab_sched:
         st.session_state["sched_done"] = False
         st.success("✅ Test završen. Proveri statistiku i log.")
 
-    # Prikaz sledećeg raspoređenog pokretanja
+    # ── Live odbrojavanje do sledećeg skena ─────────────────────────────────
     st.markdown("---")
     cfg_cur = load_scheduler_config()
     if cfg_cur.get("enabled"):
-        now = datetime.datetime.now()
+        now    = beograd_now()
         target = now.replace(hour=cfg_cur["hour"], minute=cfg_cur["minute"], second=0, microsecond=0)
         if now >= target:
             target += datetime.timedelta(days=1)
-        diff = target - now
-        h, rem = divmod(int(diff.total_seconds()), 3600)
-        m_rem = rem // 60
-        st.success(f"🕐 Sledeći automatski sken za: **{h}h {m_rem}min** (u {cfg_cur['hour']:02d}:{cfg_cur['minute']:02d})")
+        diff      = target - now
+        total_sec = int(diff.total_seconds())
+        h,   rem  = divmod(total_sec, 3600)
+        m_r, s_r  = divmod(rem, 60)
+
+        # Progress bar: koliko dana je prošlo od zadnjeg okidanja
+        day_sec   = 24 * 3600
+        elapsed   = day_sec - total_sec
+        progress  = max(0.0, min(1.0, elapsed / day_sec))
+
+        st.markdown(f"""
+        <div style='background:#fff;border-radius:12px;padding:20px 24px;
+                    box-shadow:0 2px 8px rgba(0,0,0,0.07);text-align:center;margin-bottom:12px'>
+          <div style='font-size:.85rem;color:#888;margin-bottom:6px'>⏱️ Sledeći automatski sken</div>
+          <div style='font-size:2.6rem;font-weight:800;color:#009de0;letter-spacing:2px'>
+            {h:02d}:{m_r:02d}:{s_r:02d}
+          </div>
+          <div style='font-size:.85rem;color:#555;margin-top:6px'>
+            pokreće se u <b>{cfg_cur["hour"]:02d}:{cfg_cur["minute"]:02d}</b> po beogradskom vremenu
+            &nbsp;|&nbsp; sada: <b>{now.strftime("%H:%M:%S")}</b>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.progress(progress)
+        st.caption(f"Gradovi: {', '.join(cfg_cur.get('cities', []))}")
+
+        # Auto-refresh svakih 1s dok je scheduler tab aktivan
+        time.sleep(1)
+        st.rerun()
     else:
-        st.warning("Automatski sken je isključen.")
+        st.warning("⚠️ Automatski sken je isključen. Uključi ga gore i sačuvaj podešavanja.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6: DEBUG API
@@ -1547,249 +1822,10 @@ Cookie traje ~24h.
 
     st.markdown("---")
     st.markdown("#### ⚙️ Podešavanja fetcha")
-    st.info(
-        f"Paralelni threadovi: **{FETCH_WORKERS}** | "
-        f"Rate limit: **3 req/s** globalno | "
-        f"Max retry: **3x** na 429 (čeka 5–15s)"
-    )
-
-    # ── FETCH DEBUG LOG ───────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 📋 Fetch Debug Log")
-    st.caption("Log svih grešaka iz poslednjeg skena — 429, auth greške, timeout, exceptions.")
-
-    lcol1, lcol2, lcol3 = st.columns(3)
-    with lcol1:
-        if st.button("🔄 Osveži log", key="refresh_log"):
-            st.rerun()
-    with lcol2:
-        if st.button("🗑️ Obriši log", key="clear_log"):
-            Path("_fetch_debug.log").unlink(missing_ok=True)
-            st.success("Log obrisan.")
-            st.rerun()
-    with lcol3:
-        auto_ref = st.checkbox("⏱️ Auto-refresh 3s", value=False, key="log_auto")
-
-    try:
-        log_txt = Path("_fetch_debug.log").read_text(encoding="utf-8")
-    except FileNotFoundError:
-        log_txt = ""
-
-    if not log_txt.strip():
-        st.info("Log je prazan. Pokreni sken pa osvježi.")
-    else:
-        lines = [l for l in log_txt.strip().split("\n") if l.strip()]
-
-        # Grupiši po tipu
-        lines_429  = [l for l in lines if "429"      in l]
-        lines_auth = [l for l in lines if "AUTH"     in l]
-        lines_time = [l for l in lines if "TIMEOUT"  in l]
-        lines_exc  = [l for l in lines if "EXC"      in l or "PARSE ERR" in l]
-        lines_http = [l for l in lines if "HTTP"     in l and "429" not in l and "AUTH" not in l]
-
-        # Summary
-        c1, c2, c3, c4, c5 = st.columns(5)
-        for col, cnt, lbl, color in [
-            (c1, len(lines),       "Ukupno",     "#555"),
-            (c2, len(lines_429),   "⚠️ 429",     "#e67e22"),
-            (c3, len(lines_auth),  "🔐 Auth",    "#e74c3c"),
-            (c4, len(lines_time),  "⏱️ Timeout", "#8e44ad"),
-            (c5, len(lines_exc),   "💥 Exception","#c0392b"),
-        ]:
-            with col:
-                st.markdown(f"""
-                <div style='background:#fff;border-radius:8px;padding:10px;
-                            text-align:center;border-top:3px solid {color};
-                            box-shadow:0 1px 4px rgba(0,0,0,0.08)'>
-                  <div style='font-size:1.6rem;font-weight:800;color:{color}'>{cnt}</div>
-                  <div style='font-size:.8rem;color:#888'>{lbl}</div>
-                </div>""", unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        if lines_auth:
-            st.error(f"🔐 **{len(lines_auth)} AUTH grešaka (401/403)** — cookie je istekao!")
-            with st.expander("Prikaži auth greške", expanded=True):
-                st.code("\n".join(lines_auth), language=None)
-
-        if lines_429:
-            st.warning(f"⚠️ **{len(lines_429)} puta 429 Too Many Requests**")
-            with st.expander(f"Prikaži 429 greške ({len(lines_429)})"):
-                st.code("\n".join(lines_429[-100:]), language=None)
-
-        if lines_time:
-            st.warning(f"⏱️ **{len(lines_time)} Timeout-a**")
-            with st.expander(f"Prikaži timeout greške ({len(lines_time)})"):
-                st.code("\n".join(lines_time), language=None)
-
-        if lines_exc:
-            st.error(f"💥 **{len(lines_exc)} Exceptions/Parse grešaka**")
-            with st.expander(f"Prikaži exceptions ({len(lines_exc)})"):
-                st.code("\n".join(lines_exc), language=None)
-
-        if lines_http:
-            with st.expander(f"Ostali HTTP kodovi ({len(lines_http)})"):
-                st.code("\n".join(lines_http), language=None)
-
-        if not any([lines_429, lines_auth, lines_time, lines_exc, lines_http]):
-            st.success("✅ Nema grešaka u logu!")
-
-        with st.expander("📄 Kompletni log (poslednjih 500 linija)"):
-            st.code("\n".join(lines[-500:]), language=None)
-
-        st.download_button(
-            "📥 Preuzmi log",
-            log_txt.encode("utf-8"),
-            "fetch_debug.log",
-            "text/plain",
-            key="dl_log"
-        )
-
-    if auto_ref:
-        time.sleep(3)
-        st.rerun()
-
-    # ── RATE LIMIT TESTER ────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 🧪 Wolt Rate Limit Tester")
-    st.caption(
-        "Šalje requestove na listing API (bez slug-a) — meri koliko req/s Wolt prihvata pre nego blokira."
-    )
-
-    rt_col1, rt_col2 = st.columns([2, 1])
-    with rt_col1:
-        test_city = st.selectbox("Grad za testiranje:", CITIES, key="rt_city")
-    with rt_col2:
-        rps_manual = st.number_input(
-            "Ili upiši req/s ručno (0.5 = najsporije):",
-            min_value=0.5, max_value=20.0, value=3.0, step=0.5,
-            key="rt_manual",
-            help="Upiši koliko req/s hoćeš pa klikni Primeni"
-        )
-
-    if st.button("🚀 Pokreni Rate Limit Test", key="rt_run", type="primary"):
-        test_city_key = display_to_key(test_city)
-        t_lat, t_lon  = CITY_COORDS.get(test_city_key, (44.8178, 20.4569))
-
-        # Koristimo listing endpoint — uvek radi, ne treba slug
-        test_url = f"https://restaurant-api.wolt.com/v1/pages/restaurants?lat={t_lat}&lon={t_lon}&skip=0"
-
-        # Kreiraj session SA cookie-jem direktno (debug tab ne koristi _scan_cookie.txt)
-        ts = requests.Session()
-        ts.headers.update(BROWSER_HEADERS)
-        _ck = st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or ""
-        if _ck:
-            ts.headers["Cookie"] = _ck
-
-        # Korak 1: proveri da li URL uopšte radi
-        probe = ts.get(test_url, timeout=10)
-        if probe.status_code not in (200, 429):
-            st.error(f"❌ API ne odgovara (HTTP {probe.status_code}). Proveri cookie.")
-        elif probe.status_code == 429:
-            st.error("❌ Odmah 429 na prvom requestu — cookie nije postavljen ili je istekao! Unesi cookie gore pa pokušaj ponovo.")
-        if probe.status_code == 200:
-            results  = []
-            hit_429  = False
-            safe_rps = None
-
-            # Testiramo od sporo → brzo: 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15 req/s
-            test_rps_list = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0]
-            progress_bar  = st.progress(0, text="🔄 Testiram...")
-
-            for i, rps in enumerate(test_rps_list):
-                delay_s = 1.0 / rps
-                progress_bar.progress(
-                    (i + 1) / len(test_rps_list),
-                    text=f"🔄 Testiram {rps} req/s ({int(delay_s*1000)}ms delay)..."
-                )
-
-                codes = []
-                for _ in range(6):   # 6 requestova po brzini
-                    t0 = time.time()
-                    try:
-                        r  = ts.get(test_url, timeout=8)
-                        codes.append(r.status_code)
-                        results.append({"rps": rps, "delay_ms": int(delay_s*1000), "status": r.status_code})
-                    except Exception:
-                        codes.append(-1)
-                        results.append({"rps": rps, "delay_ms": int(delay_s*1000), "status": -1})
-                    elapsed = time.time() - t0
-                    sleep_t = max(0, delay_s - elapsed)
-                    time.sleep(sleep_t)
-
-                ok_count  = codes.count(200)
-                c429_count = codes.count(429)
-
-                if c429_count >= 2:   # 2+ od 6 je prebrzo
-                    hit_429  = True
-                    safe_rps = test_rps_list[i - 1] if i > 0 else 0.5
-                    break
-                elif ok_count >= 5:   # 5+ od 6 je ok
-                    safe_rps = rps
-
-            progress_bar.empty()
-
-            df_rt = pd.DataFrame(results)
-            pivot = df_rt.groupby(["rps", "delay_ms"])["status"].apply(list).reset_index()
-            pivot["✅ 200"] = pivot["status"].apply(lambda x: x.count(200))
-            pivot["⚠️ 429"] = pivot["status"].apply(lambda x: x.count(429))
-            pivot["❌ Err"]  = pivot["status"].apply(lambda x: sum(1 for s in x if s not in (200, 429)))
-            pivot["Ocena"]  = pivot.apply(
-                lambda r: "✅ OK" if r["⚠️ 429"] == 0 else
-                          ("🚫 Blokiran" if r["⚠️ 429"] >= 2 else "⚠️ Nestabilno"),
-                axis=1
-            )
-
-            st.markdown("#### 📊 Rezultati testa")
-            st.dataframe(
-                pivot[["rps", "delay_ms", "✅ 200", "⚠️ 429", "❌ Err", "Ocena"]].rename(
-                    columns={"rps": "req/s", "delay_ms": "Delay (ms)"}
-                ),
-                use_container_width=True, hide_index=True
-            )
-
-            if hit_429 and safe_rps:
-                st.error(f"🚨 429 na {test_rps_list[i]} req/s — bezbedno je **{safe_rps} req/s**")
-            elif safe_rps:
-                st.success(f"✅ Nema 429 do {safe_rps} req/s!")
-            else:
-                st.warning("⚠️ Nije uspelo odrediti limit. Koristi manuelni unos.")
-                safe_rps = 2.0
-
-            # Primeni na sken (80% od max za bezbednost)
-            applied_rps     = round((safe_rps or 2.0) * 0.8, 2)
-            applied_workers = max(1, min(15, int((safe_rps or 2.0) * 0.6)))
-            st.session_state["_auto_rps"]     = applied_rps
-            st.session_state["_auto_workers"] = applied_workers
-            Path("_auto_rps.txt").write_text(str(applied_rps))
-            st.info(
-                f"💡 Primenjeno: **{applied_rps} req/s** (80% od max {safe_rps}) "
-                f"| **{applied_workers} workera**"
-            )
-
-    # Manuelni unos
-    if rps_manual > 0:
-        if st.button("✅ Primeni manuelni limit", key="rt_apply_manual"):
-            applied = round(rps_manual, 2)
-            workers = max(1, min(15, int(rps_manual * 0.6)))
-            st.session_state["_auto_rps"]     = applied
-            st.session_state["_auto_workers"] = workers
-            Path("_auto_rps.txt").write_text(str(applied))
-            st.success(f"✅ Primenjeno: {applied} req/s | {workers} workera")
-
-    # Prikaz trenutno aktivnih vrednosti
-    cur_rps = st.session_state.get("_auto_rps")
-    try:
-        cur_rps = float(Path("_auto_rps.txt").read_text().strip())
-    except Exception:
-        pass
-    if cur_rps:
-        st.success(
-            f"⚙️ **Trenutno aktivno:** {cur_rps} req/s | "
-            f"{st.session_state.get('_auto_workers', '?')} workera"
-        )
-    else:
-        st.info("⚙️ **Default:** 3.0 req/s | 5 workera (nije testiran limit)")
+    st.info(f"Paralelni threadovi: **{FETCH_WORKERS}** | "
+            f"Rate limit: **{RATE_LIMIT} req/s** (jedan request svakih {1/RATE_LIMIT:.2f}s). "
+            "Ako dobijaš 429 → smanji `RATE_LIMIT` (npr. 1.5). "
+            "Ako nema 429 → povećaj `RATE_LIMIT` (npr. 3.0) za brže skeniranje.")
 
     st.markdown("---")
     st.markdown("#### 🚫 Filtrirane akcije iz emaila")
@@ -1882,3 +1918,42 @@ Cookie traje ~24h.
                 st.json(loyalty_data)
         else:
             st.warning(f"Loyalty endpoint nije vratio podatke. HTTP status: {loyalty_status}")
+
+    st.markdown("---")
+    st.markdown("### 📋 Fetch Debug Log")
+    st.markdown("Log svih API poziva iz poslednjeg skena (samo restorani sa greškom ili bez akcija).")
+    col_log1, col_log2 = st.columns([1, 1])
+    with col_log1:
+        if st.button("🔄 Osveži log", key="refresh_log"):
+            st.rerun()
+    with col_log2:
+        if st.button("🗑️ Obriši log", key="clear_log"):
+            Path("_fetch_debug.log").unlink(missing_ok=True)
+            st.success("Log obrisan.")
+    try:
+        log_content = Path("_fetch_debug.log").read_text(encoding="utf-8")
+        if log_content.strip():
+            lines = log_content.strip().split("\n")
+            st.markdown(f"**{len(lines)} linija u logu**")
+            # Grupiši po tipu greške
+            auth_fails = [l for l in lines if "auth fail" in l]
+            no_akcija  = [l for l in lines if "NEMA akcija" in l]
+            errors     = [l for l in lines if "EXC" in l or "→ 4" in l or "→ 5" in l]
+            if auth_fails:
+                st.error(f"🔐 **{len(auth_fails)} auth grešaka (401/403)** — cookie možda istekao!")
+                with st.expander(f"Auth greške ({len(auth_fails)})"):
+                    st.text("\n".join(auth_fails[:50]))
+            if no_akcija:
+                st.warning(f"🔍 **{len(no_akcija)} restorana sa 200 ali bez akcija**")
+                with st.expander(f"Bez akcija ({len(no_akcija)})"):
+                    st.text("\n".join(no_akcija[:100]))
+            if errors:
+                st.warning(f"⚠️ **{len(errors)} ostalih grešaka**")
+                with st.expander(f"Ostale greške ({len(errors)})"):
+                    st.text("\n".join(errors[:50]))
+            if not auth_fails and not no_akcija and not errors:
+                st.success("✅ Nema grešaka u logu!")
+        else:
+            st.info("Log je prazan. Pokreni sken pa osvježi.")
+    except FileNotFoundError:
+        st.info("Log fajl ne postoji. Pokreni sken pa osvježi.")
