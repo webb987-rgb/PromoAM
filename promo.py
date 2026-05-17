@@ -431,14 +431,13 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
                 time.sleep(0.5)
     return None, -1
 
-def _check_item_discounts(slug: str, ts: requests.Session, stop_event: threading.Event) -> list:
+def _has_item_discounts(slug: str, ts: requests.Session, stop_event: threading.Event) -> bool:
     """
-    Poziva Wolt assortment API za restoran i traži artikle koji imaju
-    discounted_price (snižena cena) manji od base_price (stara/puna cena).
-    Vraća listu akcija u formatu '• [Sniženje] Naziv artikla: 500→350 RSD'.
+    Poziva Wolt assortment API i proverava da li BILO KOJI artikal ima
+    discounted_price < base_price. Vraća True/False.
     """
     if stop_event.is_set():
-        return []
+        return False
 
     assortment_url = (
         f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
@@ -449,47 +448,29 @@ def _check_item_discounts(slug: str, ts: requests.Session, stop_event: threading
         r = ts.get(assortment_url, timeout=12)
         if r.status_code != 200:
             _log_fetch(f"ASSORTMENT {slug} → {r.status_code}")
-            return []
+            return False
         data = r.json()
     except Exception as e:
         _log_fetch(f"ASSORTMENT {slug} → EXC {e}")
-        return []
-
-    discounted_items = []
-    seen_names = set()
+        return False
 
     for item in data.get("items", []):
         if stop_event.is_set():
-            break
-
+            return False
         base_price       = item.get("base_price")
         discounted_price = item.get("discounted_price")
-        name             = (item.get("name") or "").strip()
-
-        if not name or name in seen_names:
-            continue
-
-        # Postoji sniženje samo ako su oba polja prisutna i discounted < base
         if (
             base_price is not None
             and discounted_price is not None
             and isinstance(base_price, (int, float))
             and isinstance(discounted_price, (int, float))
-            and discounted_price < base_price
             and base_price > 0
+            and discounted_price < base_price
         ):
-            old_rsd  = int(base_price) // 100
-            new_rsd  = int(discounted_price) // 100
-            pct      = int(round((1 - discounted_price / base_price) * 100))
-            seen_names.add(name)
-            discounted_items.append(
-                f"• [Sniženje -{pct}%] {name}: {old_rsd}→{new_rsd} RSD"
-            )
+            _log_fetch(f"ASSORTMENT {slug} → sniženje pronađeno")
+            return True
 
-    if discounted_items:
-        _log_fetch(f"ASSORTMENT {slug} → {len(discounted_items)} sniženih artikala")
-
-    return discounted_items
+    return False
 
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
@@ -518,13 +499,11 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
         akcije_str = "\n".join(feed_akcije)
         _log_fetch(f"DYN {slug} → fallback na feed_akcije")
 
-    # ── Provjera sniženih artikala (old_price vs price) ──────────────────────
-    if not stop_event.is_set():
-        item_discounts = _check_item_discounts(slug, ts, stop_event)
-        if item_discounts:
-            existing = akcije_str.split("\n") if akcije_str != "-" else []
-            combined = list(dict.fromkeys(existing + item_discounts))
-            akcije_str = "\n".join(combined)
+    # ── Provera sniženih artikala (base_price vs discounted_price) ───────────
+    if not stop_event.is_set() and _has_item_discounts(slug, ts, stop_event):
+        existing = akcije_str.split("\n") if akcije_str != "-" else []
+        combined = list(dict.fromkeys(existing + ["• Sniženi artikli u meniju"]))
+        akcije_str = "\n".join(combined)
 
     return slug, akcije_str
 
