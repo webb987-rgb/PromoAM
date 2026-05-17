@@ -684,23 +684,65 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     return list(restaurants.values())
 
 
+def _write_city_status(all_cities: list, city_states: dict):
+    """Upisuje per-grad status u JSON fajl koji UI čita."""
+    import json
+    Path("_scan_city_status.json").write_text(
+        json.dumps({"cities": all_cities, "states": city_states}, ensure_ascii=False)
+    )
+
 def scan_all_cities(selected_cities: list[str], status_placeholder, stop_event: threading.Event) -> pd.DataFrame:
-    all_rows = []
+    import json
+    all_rows    = []
+    city_states = {c: {"status": "⏳ čeka...", "done": 0, "total": 0} for c in selected_cities}
+    _write_city_status(selected_cities, city_states)
+
     for i, city in enumerate(selected_cities):
         if stop_event.is_set():
             break
+
+        city_states[city]["status"] = "🔍 učitavam listu..."
+        _write_city_status(selected_cities, city_states)
+
+        # Wrapper koji ažurira per-grad status
+        class CityPH:
+            def __init__(self, city_name):
+                self.city = city_name
+            def _update(self, msg):
+                # Izvuci progress ako postoji (npr. "90/1689")
+                import re
+                m = re.search(r"(\d+)/(\d+)", str(msg))
+                if m:
+                    city_states[self.city]["done"]  = int(m.group(1))
+                    city_states[self.city]["total"] = int(m.group(2))
+                city_states[self.city]["status"] = str(msg)
+                _write_city_status(selected_cities, city_states)
+                status_placeholder.info(str(msg))
+            def info(self, msg, *a, **k):    self._update(msg)
+            def warning(self, msg, *a, **k): self._update(f"⚠️ {msg}")
+            def success(self, msg, *a, **k): self._update(msg)
+            def error(self, msg, *a, **k):   self._update(f"❌ {msg}")
+            def empty(self, *a, **k):        pass
+
         try:
-            rows = fetch_city(city, status_placeholder, stop_event)
+            rows = fetch_city(city, CityPH(city), stop_event)
             all_rows.extend(rows)
             if not stop_event.is_set():
-                status_placeholder.success(f"✅ {city} završen! ({len(rows)} restorana)")
+                city_states[city]["status"] = f"✅ završen ({len(rows)} restorana)"
+                city_states[city]["done"]   = len(rows)
+                city_states[city]["total"]  = len(rows)
+                _write_city_status(selected_cities, city_states)
         except Exception as e:
-            status_placeholder.error(f"❌ Greška za {city}: {e}")
+            city_states[city]["status"] = f"❌ greška: {e}"
+            _write_city_status(selected_cities, city_states)
             import traceback
             st.error(traceback.format_exc())
+
         if i < len(selected_cities) - 1 and not stop_event.is_set():
             time.sleep(0.5)
+
     status_placeholder.empty()
+    Path("_scan_city_status.json").unlink(missing_ok=True)
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
 # ─────────────────────────── EMAIL ───────────────────────────────────────────
@@ -1105,14 +1147,42 @@ with tab_scan:
     scan_done_flag = Path("_scan_done.txt").exists()
 
     if st.session_state.scan_running and not scan_done_flag:
+        import json
         elapsed = time.time() - (st.session_state.scan_start_time or time.time())
-        m2, s2 = divmod(int(elapsed), 60)
+        m2, s2  = divmod(int(elapsed), 60)
+
+        st.markdown(f"**🔄 Skeniranje u toku — {m2:02d}:{s2:02d}**")
+
+        # Per-grad status tabela
         try:
-            status_msg = Path("_scan_status.txt").read_text()
+            city_data = json.loads(Path("_scan_city_status.json").read_text())
+            cities    = city_data.get("cities", [])
+            states    = city_data.get("states", {})
+            for c in cities:
+                st_info = states.get(c, {})
+                done    = st_info.get("done", 0)
+                total   = st_info.get("total", 0)
+                status  = st_info.get("status", "⏳ čeka...")
+                # Progres bar po gradu
+                pct = (done / total) if total > 0 else 0.0
+                col_name, col_bar, col_cnt = st.columns([2, 5, 2])
+                with col_name:
+                    st.markdown(f"**{c}**")
+                with col_bar:
+                    st.progress(min(pct, 1.0))
+                with col_cnt:
+                    if total > 0:
+                        st.markdown(f"`{done}/{total}`")
+                    else:
+                        st.markdown(f"`{status[:30]}`")
         except Exception:
-            status_msg = "🔄 Skeniranje..."
-        st.info(f"🔄 **{m2:02d}:{s2:02d}** | {status_msg}")
-        time.sleep(2)
+            try:
+                status_msg = Path("_scan_status.txt").read_text()
+            except Exception:
+                status_msg = "🔄 Skeniranje..."
+            st.info(status_msg)
+
+        time.sleep(1)
         st.rerun()
 
     # Prikaz rezultata kad scan završi
