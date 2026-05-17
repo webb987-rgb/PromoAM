@@ -892,83 +892,38 @@ def run_scheduled_scan_and_send():
     log.info(f"[Scheduler] Završeno. Poslato mailova: {len(sent_log)}")
 
 
-def _scheduler_loop():
+def _should_trigger_scheduler() -> bool:
     """
-    Stalni pozadinski thread koji čeka pravo vreme i pali sken.
-    Koristi fajl-based locking da spreči duplo pokretanje ako Streamlit
-    restartuje sesiju (npr. pri konekciji novog korisnika).
+    Proverava da li je vreme za automatski sken.
+    Poziva se pri svakom rerun (svake sekunde iz countdown-a).
+    Koristi lock fajl da spreči duplo okidanje.
     """
-    import logging
-    import json
-    log = logging.getLogger("scheduler")
-    lock_file = Path("_scheduler_lock.txt")
-
-    while True:
-        try:
-            cfg = load_scheduler_config()
-        except Exception:
-            time.sleep(60)
-            continue
-
+    try:
+        cfg = load_scheduler_config()
         if not cfg.get("enabled"):
-            time.sleep(60)
-            continue
+            return False
 
         now    = beograd_now()
-        target = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
-        if now >= target:
-            target += datetime.timedelta(days=1)
+        h, m   = cfg["hour"], cfg["minute"]
+        # Okini ako smo u prozoru od 90 sekundi oko zakazanog vremena
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        diff   = abs((now - target).total_seconds())
+        if diff > 90:
+            return False
 
-        wait_sec = (target - now).total_seconds()
-        log.info(f"[Scheduler] Sledeći sken za {wait_sec/3600:.1f}h ({target.strftime('%H:%M')})")
-
-        # Čekaj u kratkim intervalima — proveravaj da li je scheduler ugašen
-        slept = 0
-        while slept < wait_sec:
-            time.sleep(min(30, wait_sec - slept))
-            slept += 30
+        # Lock fajl: spreči duplo okidanje
+        lock_file = Path("_scheduler_lock.txt")
+        if lock_file.exists():
             try:
-                cfg = load_scheduler_config()
-                if not cfg.get("enabled"):
-                    break
+                lock_ts = float(lock_file.read_text().strip())
+                if time.time() - lock_ts < 300:  # već okidan u poslednjih 5min
+                    return False
             except Exception:
                 pass
-        else:
-            # Proveri da li već neko drugi radi sken (dupla sesija)
-            now_check = beograd_now()
-            target_check = now_check.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
-            if abs((now_check - target_check).total_seconds()) < 120:
-                # Spremi lock sa timestamp-om
-                try:
-                    if lock_file.exists():
-                        lock_ts = float(lock_file.read_text().strip())
-                        if time.time() - lock_ts < 300:  # Vec neko radi, preskoci
-                            log.info("[Scheduler] Drugi thread već radi sken, preskačem.")
-                            time.sleep(120)
-                            continue
-                    lock_file.write_text(str(time.time()))
-                    run_scheduled_scan_and_send()
-                except Exception as e:
-                    log.error(f"[Scheduler] Greška: {e}")
-                finally:
-                    lock_file.unlink(missing_ok=True)
-
-        time.sleep(60)
-
-
-# Pokretanje scheduler threada jednom po procesu (ne po sesiji)
-_SCHEDULER_THREAD_STARTED = False
-_scheduler_lock = threading.Lock()
-
-def _ensure_scheduler():
-    global _SCHEDULER_THREAD_STARTED
-    with _scheduler_lock:
-        if not _SCHEDULER_THREAD_STARTED:
-            t = threading.Thread(target=_scheduler_loop, daemon=True, name="promo-scheduler")
-            t.start()
-            _SCHEDULER_THREAD_STARTED = True
-
-_ensure_scheduler()
+        lock_file.write_text(str(time.time()))
+        return True
+    except Exception:
+        return False
 
 # ─────────────────────────── SESSION STATE ───────────────────────────────────
 
@@ -982,6 +937,11 @@ if "scan_running" not in st.session_state:
     st.session_state.scan_running = False
 if "scan_start_time" not in st.session_state:
     st.session_state.scan_start_time = None
+
+# ── Auto-trigger scheduler ako je vreme ──────────────────────────────────
+if not st.session_state.get("scan_running") and _should_trigger_scheduler():
+    cfg_sched = load_scheduler_config()
+    st.session_state["_sched_trigger"] = cfg_sched.get("cities", CITIES)
 
 # ── Auto-load poslednjeg skena pri prvom pokretanju ──────────────────────
 if "auto_loaded" not in st.session_state:
@@ -1071,6 +1031,13 @@ with tab_scan:
         st.session_state.scan_stop_event.set()
         st.warning("⏹️ Zaustavljanje... čeka se da threadovi završe.")
 
+    # ── Auto-pokretanje iz schedulera ────────────────────────────────────────
+    sched_trigger_cities = st.session_state.pop("_sched_trigger", None)
+    if sched_trigger_cities and not st.session_state.scan_running:
+        run_scan         = True   # reuse iste logike ispod
+        selected_cities  = sched_trigger_cities
+        st.toast("⏰ Automatski sken pokrenuti po rasporedu!", icon="🚀")
+
     # Pokretanje skena
     if run_scan and selected_cities and not st.session_state.scan_running:
         cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
@@ -1097,6 +1064,8 @@ with tab_scan:
         _cookie_snap = st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or ""
         Path("_scan_cookie.txt").write_text(_cookie_snap)
 
+        _is_sched_scan = bool(sched_trigger_cities)
+
         def _run_scan_bg():
             class LivePH:
                 def info(self, msg, *a, **k):
@@ -1110,9 +1079,10 @@ with tab_scan:
                 def empty(self, *a, **k):
                     pass
             result = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
-            # Čuvamo rezultat na disk – session_state nije dostupan iz threada
             if result is not None and not result.empty:
                 result.to_json("_scan_result.json", orient="records", force_ascii=False)
+                if _is_sched_scan:
+                    Path("_scan_send_mail.txt").write_text("1")
             Path("_scan_done.txt").write_text("1")
             Path("_scan_status.txt").write_text("✅ Sken završen!")
 
@@ -1138,6 +1108,11 @@ with tab_scan:
     if st.session_state.scan_running and scan_done_flag:
         Path("_scan_done.txt").unlink(missing_ok=True)
         st.session_state.scan_running = False
+        # Ako je bio scheduler sken → automatski pošalji mailove
+        if Path("_scan_send_mail.txt").exists():
+            Path("_scan_send_mail.txt").unlink(missing_ok=True)
+            threading.Thread(target=run_scheduled_scan_and_send, daemon=True).start()
+            st.toast("📧 Slanje alertova AM-ovima u toku...", icon="📬")
         scan_duration = time.time() - (st.session_state.scan_start_time or time.time())
         _stop_ev = st.session_state.scan_stop_event
 
