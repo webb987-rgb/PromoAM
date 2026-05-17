@@ -1661,10 +1661,10 @@ Cookie traje ~24h.
         test_city = st.selectbox("Grad za testiranje:", CITIES, key="rt_city")
     with rt_col2:
         rps_manual = st.number_input(
-            "Ili upiši req/s ručno:",
-            min_value=0.5, max_value=20.0, value=0.0, step=0.5,
+            "Ili upiši req/s ručno (0.5 = najsporije):",
+            min_value=0.5, max_value=20.0, value=3.0, step=0.5,
             key="rt_manual",
-            help="0 = koristi automatski test"
+            help="Upiši koliko req/s hoćeš pa klikni Primeni"
         )
 
     if st.button("🚀 Pokreni Rate Limit Test", key="rt_run", type="primary"):
