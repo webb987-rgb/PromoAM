@@ -1705,4 +1705,4 @@ Cookie traje ~24h.
         else:
             st.info("Log je prazan. Pokreni sken pa osvježi.")
     except FileNotFoundError:
-        st.info("Log fajl ne postoji. Pokreni sken pa osvjež
+        st.info("Log fajl ne postoji. Pokreni sken pa osvježi.")
