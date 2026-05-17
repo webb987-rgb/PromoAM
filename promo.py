@@ -32,7 +32,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 4
+FETCH_WORKERS = 2
 
 EMAIL_IGNORE_PROMOS = [
     "0 din delivery fee for 14 days",
@@ -432,52 +432,34 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
     return None, -1
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
-    """
-    Šalje JEDAN request na assortment API.
-    Ako bilo koji artikal ima discounted_price < base_price,
-    restoran se označava sa najvećim pronađenim procentom popusta.
-    """
     if stop_event.is_set():
         return slug, "-"
 
     ts = make_thread_session()
-    assortment_url = (
-        f"https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/{slug}/assortment"
+
+    # Pauza između requestova da se izbegne 429
+    time.sleep(random.uniform(1.0, 2.0))
+
+    dyn_url = (
+        f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{slug}/dynamic/"
+        f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
 
-    try:
-        r = ts.get(assortment_url, timeout=12)
-        if r.status_code != 200:
-            _log_fetch(f"{slug} → {r.status_code}")
-            return slug, "-"
-        data = r.json()
-    except Exception as e:
-        _log_fetch(f"{slug} → EXC {e}")
-        return slug, "-"
+    akcije_str = "-"
+    dyn_data, _ = _fetch_url(ts, dyn_url, f"DYN {slug}", stop_event)
+    if dyn_data:
+        try:
+            parsed   = _parse_dynamic_with_item_discount(dyn_data)
+            combined = list(dict.fromkeys(feed_akcije + parsed))
+            akcije_str = "\n".join(combined) if combined else "-"
+            if akcije_str == "-":
+                _log_fetch(f"DYN {slug} → 200 ali NEMA akcija")
+        except Exception as e:
+            _log_fetch(f"DYN {slug} → parse EXC {e}")
+    elif feed_akcije:
+        akcije_str = "\n".join(feed_akcije)
 
-    max_pct = 0
-    for item in data.get("items", []):
-        if stop_event.is_set():
-            return slug, "-"
-        base_price       = item.get("base_price")
-        discounted_price = item.get("discounted_price")
-        if (
-            base_price is not None
-            and discounted_price is not None
-            and isinstance(base_price, (int, float))
-            and isinstance(discounted_price, (int, float))
-            and base_price > 0
-            and discounted_price < base_price
-        ):
-            pct = int(round((1 - discounted_price / base_price) * 100))
-            if pct > max_pct:
-                max_pct = pct
-
-    if max_pct > 0:
-        _log_fetch(f"{slug} → sniženje do {max_pct}%")
-        return slug, f"• Sniženje do {max_pct}%"
-
-    return slug, "-"
+    return slug, akcije_str
 
 
 def _parse_dynamic_with_item_discount(data: dict) -> list:
