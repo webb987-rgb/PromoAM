@@ -799,6 +799,94 @@ def scan_all_cities(selected_cities: list[str], status_placeholder, stop_event: 
     status_placeholder.empty()
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
+def scan_nopromo_cities(selected_cities: list[str], prev_df: pd.DataFrame, stop_event: threading.Event) -> pd.DataFrame:
+    """
+    No Promo Scan – skenira samo restorane koji u prethodnom skenu NISU imali akcije.
+    Ne prikuplja novu listu restorana, koristi već poznate slugove iz prev_df.
+    Rezultat merguje sa prev_df: ažurira akcije za skenirane, čuva stare za preskočene.
+    """
+    with _city_progress_lock:
+        _city_progress.clear()
+
+    # Filtriraj prev_df na izabrane gradove i restorane bez akcija
+    no_promo = prev_df[
+        (prev_df["grad"].isin(selected_cities)) &
+        (prev_df["akcije"] == "-")
+    ].copy()
+
+    # Za gradove koji nisu u selected_cities – zadrži ih nepromenjene
+    other = prev_df[~prev_df["grad"].isin(selected_cities)].copy()
+
+    # Za izabrane gradove koji su imali akcije – zadrži ih nepromenjene
+    had_promo = prev_df[
+        (prev_df["grad"].isin(selected_cities)) &
+        (prev_df["akcije"] != "-")
+    ].copy()
+
+    for city in selected_cities:
+        city_count = len(no_promo[no_promo["grad"] == city])
+        _update_city_progress(city, found=city_count, total=city_count,
+                              status=f"⏳ Čeka na red... ({city_count} restorana za sken)")
+    _write_status_file()
+
+    updated_rows = []
+
+    for city in selected_cities:
+        if stop_event.is_set():
+            break
+
+        city_key = display_to_key(city)
+        primary_lat, primary_lon = CITY_MULTI_COORDS.get(city_key, [(44.8178, 20.4569)])[0]
+        city_subset = no_promo[no_promo["grad"] == city]
+        slugs = city_subset["slug"].tolist() if "slug" in city_subset.columns else []
+        total = len(slugs)
+        completed = 0
+
+        _update_city_progress(city, found=total, total=total,
+                              status=f"⚡ Skeniranje akcija (0/{total})...")
+        _write_status_file()
+
+        slug_to_row = {row["slug"]: row.to_dict() for _, row in city_subset.iterrows()} if "slug" in city_subset.columns else {}
+
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    _fetch_one, slug, primary_lat, primary_lon, [], stop_event
+                ): slug
+                for slug in slugs
+            }
+            for future in as_completed(futures):
+                if stop_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    slug, akcije_str = future.result()
+                    row = dict(slug_to_row.get(slug, {}))
+                    row["akcije"] = akcije_str
+                    updated_rows.append(row)
+                except Exception:
+                    pass
+                completed += 1
+                if completed % 10 == 0 or completed == total:
+                    _update_city_progress(city, status=f"⚡ Akcije: {completed}/{total}")
+                    _write_status_file()
+
+        _update_city_progress(city, status=f"✅ Završen! {total} restorana skeniran")
+        _write_status_file()
+
+    # Merge: updated + had_promo + other
+    all_parts = []
+    if updated_rows:
+        all_parts.append(pd.DataFrame(updated_rows))
+    if not had_promo.empty:
+        all_parts.append(had_promo)
+    if not other.empty:
+        all_parts.append(other)
+
+    if all_parts:
+        return pd.concat(all_parts, ignore_index=True)
+    return prev_df.copy()
+
 # ─────────────────────────── EMAIL ───────────────────────────────────────────
 
 def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
@@ -984,6 +1072,8 @@ if "scan_running" not in st.session_state:
     st.session_state.scan_running = False
 if "scan_start_time" not in st.session_state:
     st.session_state.scan_start_time = None
+if "scan_mode" not in st.session_state:
+    st.session_state.scan_mode = "full"
 
 # ─────────────────────────── UI ──────────────────────────────────────────────
 
@@ -1012,12 +1102,31 @@ with tab_scan:
         key="selected_cities",
     )
 
-    col_btn, col_stop, col_info = st.columns([1, 1, 3])
+    # Info o prethodnom skenu i broju restorana bez akcija
+    prev_df_for_nopromo = st.session_state.df_wolt
+    nopromo_available = not prev_df_for_nopromo.empty
+    if nopromo_available:
+        no_promo_count = len(prev_df_for_nopromo[
+            prev_df_for_nopromo["grad"].isin(selected_cities) &
+            (prev_df_for_nopromo["akcije"] == "-")
+        ]) if selected_cities else 0
+    else:
+        no_promo_count = 0
+
+    col_btn, col_btn2, col_stop, col_info = st.columns([1.2, 1.5, 0.9, 2.4])
     with col_btn:
         run_scan = st.button(
-            "▶️ Pokreni scan", type="primary",
+            "▶️ Full Scan", type="primary",
             use_container_width=True,
             disabled=not selected_cities or st.session_state.scan_running,
+            help="Skenira sve restorane u izabranim gradovima od nule.",
+        )
+    with col_btn2:
+        run_nopromo = st.button(
+            f"🔍 No Promo Scan ({no_promo_count})",
+            use_container_width=True,
+            disabled=not selected_cities or st.session_state.scan_running or not nopromo_available or no_promo_count == 0,
+            help=f"Skenira samo {no_promo_count} restorana koji prošli put NISU imali akcije. Brže!",
         )
     with col_stop:
         stop_scan = st.button(
@@ -1052,6 +1161,48 @@ with tab_scan:
         st.session_state.scan_stop_event.set()
         st.warning("⏹️ Zaustavljanje... čeka se da threadovi završe.")
 
+    if run_nopromo and selected_cities and not st.session_state.scan_running and nopromo_available:
+        cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
+        if cookie:
+            session.headers["Cookie"] = cookie
+        elif "Cookie" in session.headers:
+            del session.headers["Cookie"]
+
+        st.session_state.scan_stop_event = threading.Event()
+        st.session_state.scan_running = True
+        st.session_state.scan_mode = "nopromo"
+        st.session_state.scan_start_time = time.time()
+
+        _cities_snap = list(selected_cities)
+        _stop_ev_snap = st.session_state.scan_stop_event
+        _prev_df_snap = st.session_state.df_wolt.copy()
+
+        Path("_scan_done.txt").unlink(missing_ok=True)
+        Path("_scan_result.json").unlink(missing_ok=True)
+        Path("_scan_status.txt").write_text("🔍 No Promo Scan – priprema...")
+
+        with _city_progress_lock:
+            _city_progress.clear()
+            for _c in _cities_snap:
+                _cnt = len(_prev_df_snap[(_prev_df_snap["grad"] == _c) & (_prev_df_snap["akcije"] == "-")])
+                _city_progress[_c] = {"found": _cnt, "total": _cnt, "status": f"⏳ Čeka na red... ({_cnt} res.)"}
+        _write_status_file()
+
+        _cookie_snap = st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or ""
+        Path("_scan_cookie.txt").write_text(_cookie_snap)
+
+        def _run_nopromo_bg():
+            Path("_scan_status.txt").write_text("🔍 No Promo Scan u toku...")
+            result = scan_nopromo_cities(_cities_snap, _prev_df_snap, _stop_ev_snap)
+            if result is not None and not result.empty:
+                result.to_json("_scan_result.json", orient="records", force_ascii=False)
+            Path("_scan_done.txt").write_text("1")
+            Path("_scan_status.txt").write_text("✅ No Promo Scan završen!")
+
+        bg = threading.Thread(target=_run_nopromo_bg, daemon=True)
+        bg.start()
+        st.rerun()
+
     if run_scan and selected_cities and not st.session_state.scan_running:
         cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
         if cookie:
@@ -1061,6 +1212,7 @@ with tab_scan:
 
         st.session_state.scan_stop_event = threading.Event()
         st.session_state.scan_running = True
+        st.session_state.scan_mode = "full"
         st.session_state.scan_start_time = time.time()
 
         _cities_snap = list(selected_cities)
@@ -1159,11 +1311,19 @@ with tab_scan:
             st.session_state.last_scan = local_now()
             save_scan(df_result)
             m, s = divmod(int(scan_duration), 60)
-            st.success(
-                f"✅ Scan završen za **{m:02d}:{s:02d}**! "
-                f"Pronađeno **{len(df_result)}** restorana, "
-                f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama."
-            )
+            scan_mode_done = st.session_state.get("scan_mode", "full")
+            if scan_mode_done == "nopromo":
+                newly_found = len(df_result[df_result["akcije"] != "-"])
+                st.success(
+                    f"✅ No Promo Scan završen za **{m:02d}:{s:02d}**! "
+                    f"Od prethodno preskočenih, **{newly_found}** restorana sada ima akcije."
+                )
+            else:
+                st.success(
+                    f"✅ Full Scan završen za **{m:02d}:{s:02d}**! "
+                    f"Pronađeno **{len(df_result)}** restorana, "
+                    f"**{len(df_result[df_result['akcije'] != '-'])}** sa akcijama."
+                )
             st.rerun()
         else:
             if _stop_ev.is_set():
