@@ -227,23 +227,30 @@ def _log(msg: str):
 _req_lock  = threading.Lock()
 _req_times = []   # timestamps poslednjih requestova
 
+def _get_max_rps() -> float:
+    """Vraća max req/s — iz testa ako postoji, inače default 3.0."""
+    try:
+        # Pokušaj da pročita iz fajla (thread-safe, radi i iz background threada)
+        val = float(Path("_auto_rps.txt").read_text().strip())
+        return val if 0.5 <= val <= 20.0 else 3.0
+    except Exception:
+        return 3.0
+
 def _throttle_request():
     """
-    Osigurava max 3 req/s globalno (across all threads).
-    Ako ima previše requestova u poslednjih 1s, čeka.
+    Osigurava max N req/s globalno (across all threads).
+    N se čita iz _auto_rps.txt ako je test pokrenut, inače 3.0.
     """
-    MAX_RPS = 3.0
+    MAX_RPS = _get_max_rps()
     global _req_times
     while True:
         now = time.time()
         with _req_lock:
-            # Ukloni stare (starije od 1s)
             _req_times = [t for t in _req_times if now - t < 1.0]
             if len(_req_times) < MAX_RPS:
                 _req_times.append(now)
                 break
-        # Prekoračen limit — čekaj malo
-        time.sleep(0.05)
+        time.sleep(0.02)
 
 # ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
 
@@ -1641,6 +1648,147 @@ Cookie traje ~24h.
     if auto_ref:
         time.sleep(3)
         st.rerun()
+
+    # ── RATE LIMIT TESTER ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🧪 Wolt Rate Limit Tester")
+    st.caption(
+        "Šalje requestove ka Wolt API-ju sve brže, meri tačan limit i automatski ga primenjuje na sken."
+    )
+
+    rt_col1, rt_col2 = st.columns([2, 1])
+    with rt_col1:
+        test_slug = st.text_input(
+            "Slug za testiranje (bilo koji restoran):",
+            value="mcdonalds-beograd" if "mcdonalds-beograd" else "",
+            placeholder="npr. mcdonalds-beograd",
+            key="rt_slug"
+        )
+    with rt_col2:
+        test_city = st.selectbox("Grad:", CITIES, key="rt_city")
+
+    if st.button("🚀 Pokreni Rate Limit Test", key="rt_run", type="primary"):
+        if not test_slug.strip():
+            st.error("Upiši slug restorana.")
+        else:
+            test_city_key = display_to_key(test_city)
+            t_lat, t_lon  = CITY_COORDS.get(test_city_key, (44.8178, 20.4569))
+            test_url = (
+                f"https://consumer-api.wolt.com/order-xp/web/v1/venue/slug/{test_slug.strip()}/dynamic/"
+                f"?lat={t_lat}&lon={t_lon}&selected_delivery_method=homedelivery"
+            )
+
+            ts = make_thread_session()
+
+            results   = []   # lista (delay_ms, status_code, elapsed_ms)
+            hit_429   = False
+            safe_rps  = None
+
+            progress_bar = st.progress(0, text="🔄 Testiram...")
+            result_box   = st.empty()
+
+            # Testiramo od 500ms delay pa sve brže do 50ms
+            delays_ms = [500, 400, 300, 250, 200, 180, 150, 130, 110, 100, 90, 80, 70, 60, 50]
+
+            for i, delay_ms in enumerate(delays_ms):
+                progress_bar.progress((i + 1) / len(delays_ms),
+                                      text=f"🔄 Testiram {1000/delay_ms:.1f} req/s (delay={delay_ms}ms)...")
+
+                # Pošalji 5 requestova na ovoj brzini
+                codes = []
+                for _ in range(5):
+                    t0 = time.time()
+                    try:
+                        r = ts.get(test_url, timeout=8)
+                        elapsed_ms = int((time.time() - t0) * 1000)
+                        codes.append(r.status_code)
+                        results.append({
+                            "delay_ms":   delay_ms,
+                            "rps":        round(1000 / delay_ms, 1),
+                            "status":     r.status_code,
+                            "elapsed_ms": elapsed_ms,
+                        })
+                    except Exception as e:
+                        codes.append(-1)
+                        results.append({
+                            "delay_ms": delay_ms,
+                            "rps":      round(1000 / delay_ms, 1),
+                            "status":   -1,
+                            "elapsed_ms": 0,
+                        })
+                    time.sleep(delay_ms / 1000.0)
+
+                # Ako ima 429 — ovo je prebrzo
+                if 429 in codes:
+                    hit_429 = True
+                    # Bezbedna brzina je prethodni korak
+                    if i > 0:
+                        safe_rps = round(1000 / delays_ms[i - 1], 1)
+                    else:
+                        safe_rps = 0.5
+                    break
+
+                # Ako nema 429 — ovo je ok
+                if all(c == 200 for c in codes):
+                    safe_rps = round(1000 / delay_ms, 1)
+
+            progress_bar.empty()
+
+            # Prikaz rezultata
+            df_rt = pd.DataFrame(results)
+
+            if hit_429:
+                st.error(
+                    f"🚨 **429 detektovan na {1000/delay_ms:.1f} req/s** (delay={delay_ms}ms) — "
+                    f"✅ **Bezbedna brzina: {safe_rps} req/s** (delay={int(1000/safe_rps)}ms)"
+                )
+            else:
+                safe_rps = round(1000 / delays_ms[-1], 1)
+                st.success(
+                    f"✅ **Nema 429 ni na {safe_rps} req/s!** "
+                    f"Wolt dozvoljava barem {safe_rps} req/s."
+                )
+
+            # Tabela rezultata
+            st.markdown("#### 📊 Rezultati testa")
+            pivot = df_rt.groupby(["rps", "delay_ms"])["status"].apply(list).reset_index()
+            pivot["200"] = pivot["status"].apply(lambda x: x.count(200))
+            pivot["429"] = pivot["status"].apply(lambda x: x.count(429))
+            pivot["err"] = pivot["status"].apply(lambda x: sum(1 for s in x if s not in (200, 429)))
+            pivot["ocena"] = pivot.apply(
+                lambda r: "✅ OK" if r["429"] == 0 and r["err"] == 0 else
+                          ("⚠️ 429!" if r["429"] > 0 else "❌ Greška"),
+                axis=1
+            )
+            st.dataframe(
+                pivot[["rps", "delay_ms", "200", "429", "err", "ocena"]].rename(columns={
+                    "rps": "req/s", "delay_ms": "Delay (ms)",
+                    "200": "✅ 200 OK", "429": "⚠️ 429", "err": "❌ Ostale greške", "ocena": "Ocena"
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+            # Automatska primena
+            if safe_rps and safe_rps > 0:
+                # Sačuvaj u session_state
+                st.session_state["_tested_rps"] = safe_rps
+                recommended_workers = max(1, min(15, int(safe_rps * 0.7)))
+                st.info(
+                    f"💡 Preporuka: rate limit → {safe_rps * 0.8:.1f} req/s (80% od max), "
+                    f"{recommended_workers} workera. Primenjeno automatski."
+                )
+                st.session_state["_auto_rps"]     = safe_rps * 0.8
+                st.session_state["_auto_workers"] = recommended_workers
+                # Snimi u fajl da threadovi mogu da čitaju
+                Path("_auto_rps.txt").write_text(str(round(safe_rps * 0.8, 2)))
+
+    # Prikaz trenutno primenjenih vrednosti
+    if st.session_state.get("_auto_rps"):
+        st.success(
+            f"⚙️ **Trenutno aktivno** (iz testa): "
+            f"{st.session_state['_auto_rps']:.1f} req/s | "
+            f"{st.session_state['_auto_workers']} workera"
+        )
 
     st.markdown("---")
     st.markdown("#### 🚫 Filtrirane akcije iz emaila")
