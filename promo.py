@@ -97,8 +97,18 @@ st.markdown("""
 def normalize(name: str) -> str:
     return re.sub(r"[^\w]", "", str(name).lower())
 
+def beograd_now() -> datetime.datetime:
+    """Vraća trenutno vreme u beogradskoj vremenskoj zoni (CET/CEST)."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo("Europe/Belgrade")
+    except Exception:
+        import pytz
+        tz = pytz.timezone("Europe/Belgrade")
+    return datetime.datetime.now(tz)
+
 def local_now() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return beograd_now().strftime("%Y-%m-%d %H:%M:%S")
 
 def display_to_key(display_name: str) -> str:
     for key, disp in CITY_DISPLAY.items():
@@ -735,7 +745,7 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
         if not rows_html:
             return True
 
-        today_str = datetime.date.today().strftime("%d.%m.%Y")
+        today_str = beograd_now().strftime("%d.%m.%Y")
 
         html = f"""
         <html><body style='font-family:Arial,sans-serif;color:#222;max-width:720px;margin:auto'>
@@ -904,7 +914,7 @@ def _scheduler_loop():
             time.sleep(60)
             continue
 
-        now    = datetime.datetime.now()
+        now    = beograd_now()
         target = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
         if now >= target:
             target += datetime.timedelta(days=1)
@@ -925,7 +935,7 @@ def _scheduler_loop():
                 pass
         else:
             # Proveri da li već neko drugi radi sken (dupla sesija)
-            now_check = datetime.datetime.now()
+            now_check = beograd_now()
             target_check = now_check.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
             if abs((now_check - target_check).total_seconds()) < 120:
                 # Spremi lock sa timestamp-om
@@ -1672,20 +1682,46 @@ with tab_sched:
         st.session_state["sched_done"] = False
         st.success("✅ Test završen. Proveri statistiku i log.")
 
-    # Prikaz sledećeg raspoređenog pokretanja
+    # ── Live odbrojavanje do sledećeg skena ─────────────────────────────────
     st.markdown("---")
     cfg_cur = load_scheduler_config()
     if cfg_cur.get("enabled"):
-        now = datetime.datetime.now()
+        now    = beograd_now()
         target = now.replace(hour=cfg_cur["hour"], minute=cfg_cur["minute"], second=0, microsecond=0)
         if now >= target:
             target += datetime.timedelta(days=1)
-        diff = target - now
-        h, rem = divmod(int(diff.total_seconds()), 3600)
-        m_rem = rem // 60
-        st.success(f"🕐 Sledeći automatski sken za: **{h}h {m_rem}min** (u {cfg_cur['hour']:02d}:{cfg_cur['minute']:02d})")
+        diff      = target - now
+        total_sec = int(diff.total_seconds())
+        h,   rem  = divmod(total_sec, 3600)
+        m_r, s_r  = divmod(rem, 60)
+
+        # Progress bar: koliko dana je prošlo od zadnjeg okidanja
+        day_sec   = 24 * 3600
+        elapsed   = day_sec - total_sec
+        progress  = max(0.0, min(1.0, elapsed / day_sec))
+
+        st.markdown(f"""
+        <div style='background:#fff;border-radius:12px;padding:20px 24px;
+                    box-shadow:0 2px 8px rgba(0,0,0,0.07);text-align:center;margin-bottom:12px'>
+          <div style='font-size:.85rem;color:#888;margin-bottom:6px'>⏱️ Sledeći automatski sken</div>
+          <div style='font-size:2.6rem;font-weight:800;color:#009de0;letter-spacing:2px'>
+            {h:02d}:{m_r:02d}:{s_r:02d}
+          </div>
+          <div style='font-size:.85rem;color:#555;margin-top:6px'>
+            pokreće se u <b>{cfg_cur["hour"]:02d}:{cfg_cur["minute"]:02d}</b> po beogradskom vremenu
+            &nbsp;|&nbsp; sada: <b>{now.strftime("%H:%M:%S")}</b>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.progress(progress)
+        st.caption(f"Gradovi: {', '.join(cfg_cur.get('cities', []))}")
+
+        # Auto-refresh svakih 1s dok je scheduler tab aktivan
+        time.sleep(1)
+        st.rerun()
     else:
-        st.warning("Automatski sken je isključen.")
+        st.warning("⚠️ Automatski sken je isključen. Uključi ga gore i sačuvaj podešavanja.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6: DEBUG API
