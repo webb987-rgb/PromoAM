@@ -2006,9 +2006,12 @@ Cookie traje ~24h.
                 st.dataframe(snizeni, use_container_width=True)
             else:
                 st.warning("❌ Nema artikala sa discounted_price < base_price")
-            st.markdown("**Prvih 5 artikala (sirova polja):**")
-            for item in items[:5]:
-                st.json({"name": item.get("name"), "base_price": item.get("base_price"), "discounted_price": item.get("discounted_price"), "price": item.get("price")})
+            st.markdown(f"**Svi artikli ({len(items)}) — sirova polja:**")
+            st.dataframe(
+                [{"name": item.get("name"), "price": (item.get("price") or 0) / 100, "base_price": (item.get("base_price") or 0) / 100, "discounted_price": (item.get("discounted_price") or 0) / 100} for item in items],
+                use_container_width=True,
+                height=600,
+            )
         else:
             st.warning(f"Assortment endpoint nije vratio podatke. HTTP status: {assortment_status}")
 
