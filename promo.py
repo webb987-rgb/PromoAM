@@ -1,4 +1,6 @@
 import re
+import io
+import base64
 import time
 import datetime
 import smtplib
@@ -39,14 +41,39 @@ EMAIL_IGNORE_PROMOS = [
     # NE filtriramo: item popuste, basket popuste, % popuste – to su prave akcije
 ]
 
-AMM_FILE   = Path("amm_baza.csv")
 AMM_COLS   = ["restaurant_norm", "restaurant_display", "city", "am_name", "am_email"]
-
-ALERT_FILE = Path("alert_log.csv")
 ALERT_COLS = ["timestamp", "city", "restaurant_display", "am_name", "am_email", "akcije"]
 
-# Fajl u kome čuvamo rezultate poslednjeg skena – permanentna baza
-SCAN_FILE  = Path("scan_baza_item.json")
+# ─────────────────────────── GITHUB INTEGRACIJA ──────────────────────────────
+
+def _gh_headers() -> dict:
+    token = st.secrets["github"]["token"]
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+def _gh_repo() -> str:
+    return st.secrets["github"]["repo"]
+
+def gh_read(path: str) -> tuple:
+    """Čita fajl sa GitHuba. Vraća (sadrzaj, sha) ili (None, None) ako ne postoji."""
+    url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
+    r = requests.get(url, headers=_gh_headers(), timeout=15)
+    if r.status_code == 200:
+        data = r.json()
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        return content, data["sha"]
+    return None, None
+
+def gh_write(path: str, content_str: str, sha, message: str = "update") -> bool:
+    """Upisuje fajl na GitHub (create ili update)."""
+    url = f"https://api.github.com/repos/{_gh_repo()}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_str.encode("utf-8")).decode("utf-8"),
+    }
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=_gh_headers(), json=payload, timeout=15)
+    return r.status_code in (200, 201)
 
 # ─────────────────────────── PAGE CONFIG ─────────────────────────────────────
 
@@ -98,60 +125,89 @@ def filter_akcije_for_email(akcije_str: str) -> str:
     filtered = [l for l in lines if not is_ignored_promo(l)]
     return "\n".join(filtered) if filtered else "-"
 
-# ─────────────────────────── PERMANENTNA BAZA SKENA ─────────────────────────
+# ─────────────────────────── PERMANENTNA BAZA SKENA (GitHub) ────────────────
 
 def save_scan(df: pd.DataFrame):
-    """Čuva rezultate skena u JSON fajl (permanentna baza)."""
-    df.to_json(SCAN_FILE, orient="records", force_ascii=False)
+    """Čuva rezultate skena u GitHub (scan_baza_item.json)."""
+    try:
+        json_str = df.to_json(orient="records", force_ascii=False)
+        _, sha = gh_read("scan_baza_item.json")
+        gh_write("scan_baza_item.json", json_str, sha, "scan: update results")
+    except Exception as e:
+        st.warning(f"⚠️ Nije uspelo čuvanje skena na GitHub: {e}")
 
 def load_scan() -> pd.DataFrame:
-    """Učitava prethodni sken iz JSON fajla."""
-    if SCAN_FILE.exists():
-        try:
-            df = pd.read_json(SCAN_FILE, orient="records")
-            return df
-        except Exception:
-            return pd.DataFrame()
+    """Učitava prethodni sken sa GitHuba."""
+    try:
+        content, _ = gh_read("scan_baza_item.json")
+        if content and content.strip() and content.strip() != "[]":
+            return pd.read_json(io.StringIO(content), orient="records")
+    except Exception:
+        pass
     return pd.DataFrame()
 
 def scan_meta() -> str:
-    """Vraća datum/vreme poslednjeg sačuvanog skena."""
-    if SCAN_FILE.exists():
-        mtime = SCAN_FILE.stat().st_mtime
-        return datetime.datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
+    """Proverava da li postoji sačuvan sken na GitHubu."""
+    try:
+        url = f"https://api.github.com/repos/{_gh_repo()}/contents/scan_baza_item.json"
+        r = requests.get(url, headers=_gh_headers(), timeout=10)
+        if r.status_code == 200:
+            ts = r.json().get("last_modified") or r.json().get("sha", "")[:7]
+            return ts if ts else "postoji"
+    except Exception:
+        pass
     return None
 
-# ─────────────────────────── AMM BAZA ────────────────────────────────────────
+# ─────────────────────────── AMM BAZA (GitHub) ───────────────────────────────
 
 def load_amm() -> pd.DataFrame:
-    if AMM_FILE.exists():
-        df = pd.read_csv(AMM_FILE)
-        for c in AMM_COLS:
-            if c not in df.columns:
-                df[c] = ""
-        return df
+    try:
+        content, _ = gh_read("amm_baza.csv")
+        if content and content.strip():
+            df = pd.read_csv(io.StringIO(content))
+            for c in AMM_COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df
+    except Exception:
+        pass
     return pd.DataFrame(columns=AMM_COLS)
 
 def save_amm(df: pd.DataFrame):
-    df.to_csv(AMM_FILE, index=False)
+    try:
+        csv_str = df.to_csv(index=False)
+        _, sha = gh_read("amm_baza.csv")
+        ok = gh_write("amm_baza.csv", csv_str, sha, "amm: update baza")
+        if not ok:
+            st.warning("⚠️ Nije uspelo čuvanje AMM baze na GitHub.")
+    except Exception as e:
+        st.warning(f"⚠️ GitHub greška pri čuvanju AMM: {e}")
 
-# ─────────────────────────── ALERT LOG ───────────────────────────────────────
+# ─────────────────────────── ALERT LOG (GitHub) ──────────────────────────────
 
 def load_alert_log() -> pd.DataFrame:
-    if ALERT_FILE.exists():
-        df = pd.read_csv(ALERT_FILE)
-        for c in ALERT_COLS:
-            if c not in df.columns:
-                df[c] = ""
-        return df
+    try:
+        content, _ = gh_read("alert_log.csv")
+        if content and content.strip():
+            df = pd.read_csv(io.StringIO(content))
+            for c in ALERT_COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df
+    except Exception:
+        pass
     return pd.DataFrame(columns=ALERT_COLS)
 
 def append_alert_log(rows: list):
-    df_new = pd.DataFrame(rows)
-    if ALERT_FILE.exists():
-        pd.concat([pd.read_csv(ALERT_FILE), df_new], ignore_index=True).to_csv(ALERT_FILE, index=False)
-    else:
-        df_new.to_csv(ALERT_FILE, index=False)
+    try:
+        existing = load_alert_log()
+        df_new   = pd.DataFrame(rows)
+        merged   = pd.concat([existing, df_new], ignore_index=True)
+        csv_str  = merged.to_csv(index=False)
+        _, sha   = gh_read("alert_log.csv")
+        gh_write("alert_log.csv", csv_str, sha, "alert: append log")
+    except Exception as e:
+        st.warning(f"⚠️ GitHub greška pri čuvanju alert loga: {e}")
 
 # ─────────────────────────── WOLT API & SESSION ──────────────────────────────
 
@@ -723,20 +779,24 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
 
 # ─────────────────────────── AUTO-SCHEDULER ──────────────────────────────────
 
-SCHEDULER_FILE = Path("scheduler_config.json")
-
 def load_scheduler_config() -> dict:
     import json
-    if SCHEDULER_FILE.exists():
-        try:
-            return json.loads(SCHEDULER_FILE.read_text())
-        except Exception:
-            pass
+    try:
+        content, _ = gh_read("scheduler_config.json")
+        if content:
+            return json.loads(content)
+    except Exception:
+        pass
     return {"enabled": False, "hour": 8, "minute": 0, "cities": CITIES}
 
 def save_scheduler_config(cfg: dict):
     import json
-    SCHEDULER_FILE.write_text(json.dumps(cfg))
+    try:
+        cfg_str = json.dumps(cfg)
+        _, sha  = gh_read("scheduler_config.json")
+        gh_write("scheduler_config.json", cfg_str, sha, "scheduler: update config")
+    except Exception as e:
+        st.warning(f"⚠️ GitHub greška pri čuvanju scheduler config: {e}")
 
 def run_scheduled_scan_and_send():
     """
@@ -823,29 +883,82 @@ def run_scheduled_scan_and_send():
 
 
 def _scheduler_loop():
-    """Stalni pozadinski thread koji čeka pravo vreme i pali sken."""
+    """
+    Stalni pozadinski thread koji čeka pravo vreme i pali sken.
+    Koristi fajl-based locking da spreči duplo pokretanje ako Streamlit
+    restartuje sesiju (npr. pri konekciji novog korisnika).
+    """
     import logging
+    import json
     log = logging.getLogger("scheduler")
+    lock_file = Path("_scheduler_lock.txt")
+
     while True:
-        cfg = load_scheduler_config()
-        if cfg.get("enabled"):
-            now = datetime.datetime.now()
-            target = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
-            if now >= target:
-                target += datetime.timedelta(days=1)
-            wait_sec = (target - now).total_seconds()
-            log.info(f"[Scheduler] Sledeći sken za {wait_sec/3600:.1f}h")
-            time.sleep(wait_sec)
-            run_scheduled_scan_and_send()
+        try:
+            cfg = load_scheduler_config()
+        except Exception:
+            time.sleep(60)
+            continue
+
+        if not cfg.get("enabled"):
+            time.sleep(60)
+            continue
+
+        now    = datetime.datetime.now()
+        target = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
+        if now >= target:
+            target += datetime.timedelta(days=1)
+
+        wait_sec = (target - now).total_seconds()
+        log.info(f"[Scheduler] Sledeći sken za {wait_sec/3600:.1f}h ({target.strftime('%H:%M')})")
+
+        # Čekaj u kratkim intervalima — proveravaj da li je scheduler ugašen
+        slept = 0
+        while slept < wait_sec:
+            time.sleep(min(30, wait_sec - slept))
+            slept += 30
+            try:
+                cfg = load_scheduler_config()
+                if not cfg.get("enabled"):
+                    break
+            except Exception:
+                pass
         else:
-            time.sleep(60)  # Proveri ponovo za minutu
+            # Proveri da li već neko drugi radi sken (dupla sesija)
+            now_check = datetime.datetime.now()
+            target_check = now_check.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
+            if abs((now_check - target_check).total_seconds()) < 120:
+                # Spremi lock sa timestamp-om
+                try:
+                    if lock_file.exists():
+                        lock_ts = float(lock_file.read_text().strip())
+                        if time.time() - lock_ts < 300:  # Vec neko radi, preskoci
+                            log.info("[Scheduler] Drugi thread već radi sken, preskačem.")
+                            time.sleep(120)
+                            continue
+                    lock_file.write_text(str(time.time()))
+                    run_scheduled_scan_and_send()
+                except Exception as e:
+                    log.error(f"[Scheduler] Greška: {e}")
+                finally:
+                    lock_file.unlink(missing_ok=True)
+
+        time.sleep(60)
 
 
-# Pokretanje scheduler threada jednom po sesiji
-if "scheduler_started" not in st.session_state:
-    t = threading.Thread(target=_scheduler_loop, daemon=True)
-    t.start()
-    st.session_state["scheduler_started"] = True
+# Pokretanje scheduler threada jednom po procesu (ne po sesiji)
+_SCHEDULER_THREAD_STARTED = False
+_scheduler_lock = threading.Lock()
+
+def _ensure_scheduler():
+    global _SCHEDULER_THREAD_STARTED
+    with _scheduler_lock:
+        if not _SCHEDULER_THREAD_STARTED:
+            t = threading.Thread(target=_scheduler_loop, daemon=True, name="promo-scheduler")
+            t.start()
+            _SCHEDULER_THREAD_STARTED = True
+
+_ensure_scheduler()
 
 # ─────────────────────────── SESSION STATE ───────────────────────────────────
 
@@ -860,7 +973,27 @@ if "scan_running" not in st.session_state:
 if "scan_start_time" not in st.session_state:
     st.session_state.scan_start_time = None
 
+# ── Auto-load poslednjeg skena pri prvom pokretanju ──────────────────────
+if "auto_loaded" not in st.session_state:
+    st.session_state["auto_loaded"] = True
+    try:
+        prev_df = load_scan()
+        if not prev_df.empty:
+            st.session_state.df_wolt = prev_df
+            st.session_state.last_scan = "GitHub (auto-učitan)"
+    except Exception:
+        pass
+
 # ─────────────────────────── UI ──────────────────────────────────────────────
+
+# ── Anti-sleep: skripta sama sebe pinguje da Streamlit Cloud ne zaspi ────
+# Streamlit Cloud uspava app posle ~15min neaktivnosti.
+# Ovaj kod ubacuje nevidljivi iframe koji osvežava stranicu svakih 10 minuta.
+st.markdown(
+    '<iframe src="javascript:setInterval(function(){fetch(window.location.href)},600000)" '
+    'style="display:none"></iframe>',
+    unsafe_allow_html=True,
+)
 
 st.title("🏷️ Promo Monitor – Item Level")
 st.caption("Skenira item-level popuste: ulazi u svaki restoran i proverava da li ima makar jedan snižen proizvod. Nema dynamic akcija – samo čisto item skeniranje.")
