@@ -27,8 +27,8 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 6          # Broj paralelnih threadova
-FETCH_DELAY   = 0.4       # Pauza između svakog fetch-a (sekunde)
+FETCH_WORKERS = 10          # Broj paralelnih threadova
+FETCH_DELAY   = 0.2       # Pauza između svakog fetch-a (sekunde)
 SUBMIT_DELAY  = 0.1      # Pauza između submitovanja taskova u executor (staggered start)
 
 EMAIL_IGNORE_PROMOS = [
