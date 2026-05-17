@@ -1069,14 +1069,16 @@ with tab_scan:
         Path("_scan_done.txt").unlink(missing_ok=True)
         Path("_scan_result.json").unlink(missing_ok=True)
         Path("_scan_status.txt").write_text("🔄 Priprema skena...")
-        Path("_scan_city_progress.json").write_text("{}")
+
+        # Inicijalizuj progress SAMO za izabrane gradove, pre starta threada
+        with _city_progress_lock:
+            _city_progress.clear()
+            for _c in _cities_snap:
+                _city_progress[_c] = {"found": 0, "total": 0, "status": "⏳ Čeka na red..."}
+        _write_status_file()
 
         _cookie_snap = st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or ""
         Path("_scan_cookie.txt").write_text(_cookie_snap)
-
-        # Reset progress
-        with _city_progress_lock:
-            _city_progress.clear()
 
         def _run_scan_bg():
             class LivePH:
