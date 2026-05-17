@@ -25,7 +25,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 20
+FETCH_WORKERS = 5
 
 EMAIL_IGNORE_PROMOS = [
     "0 din delivery fee for 14 days",
@@ -208,10 +208,47 @@ def make_thread_session() -> requests.Session:
         s.headers["Cookie"] = cookie_val
     return s
 
+# ─────────────────────────── LOG SISTEM ──────────────────────────────────────
+
+_log_lock = threading.Lock()
+
+def _log(msg: str):
+    """Upisuje u debug log fajl sa timestampom."""
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    try:
+        with _log_lock:
+            with open("_fetch_debug.log", "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+# Globalni brojač requestova za throttle
+_req_lock  = threading.Lock()
+_req_times = []   # timestamps poslednjih requestova
+
+def _throttle_request():
+    """
+    Osigurava max 3 req/s globalno (across all threads).
+    Ako ima previše requestova u poslednjih 1s, čeka.
+    """
+    MAX_RPS = 3.0
+    global _req_times
+    while True:
+        now = time.time()
+        with _req_lock:
+            # Ukloni stare (starije od 1s)
+            _req_times = [t for t in _req_times if now - t < 1.0]
+            if len(_req_times) < MAX_RPS:
+                _req_times.append(now)
+                break
+        # Prekoračen limit — čekaj malo
+        time.sleep(0.05)
+
 # ─────────────────────────── FETCH AKCIJA (PARALELNO) ────────────────────────
 
 def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event: threading.Event) -> tuple[str, str]:
-    """Samo dynamic endpoint — brzo, 1 HTTP poziv po restoranu."""
+    """Samo dynamic endpoint sa rate limitom i logom."""
     if stop_event.is_set():
         return slug, "-"
 
@@ -221,28 +258,49 @@ def _fetch_one(slug: str, lat: float, lon: float, feed_akcije: list, stop_event:
         f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery"
     )
 
-    for attempt in range(2):
+    for attempt in range(3):
         if stop_event.is_set():
             break
+
+        _throttle_request()   # max 3 req/s globalno
+
         try:
-            r = ts.get(dyn_url, timeout=8)
-            if r.status_code in (401, 403):
-                break
-            if r.status_code == 429:
-                wait = 2 + attempt * 3
-                time.sleep(wait + random.uniform(0, 0.5))
-                continue
+            r = ts.get(dyn_url, timeout=10)
+
             if r.status_code == 200:
                 try:
                     parsed   = _parse_dynamic_with_item_discount(r.json())
                     combined = list(dict.fromkeys(feed_akcije + parsed))
                     return slug, "\n".join(combined) if combined else "-"
-                except Exception:
+                except Exception as e:
+                    _log(f"PARSE ERR {slug}: {e}")
                     break
-            break
-        except Exception:
-            if attempt < 1:
-                time.sleep(0.3)
+
+            elif r.status_code == 429:
+                wait = 5 + attempt * 5 + random.uniform(0, 2)
+                _log(f"429 {slug} → čekam {wait:.1f}s (pokušaj {attempt+1}/3)")
+                time.sleep(wait)
+                continue
+
+            elif r.status_code in (401, 403):
+                _log(f"AUTH {r.status_code} {slug} → cookie istekao!")
+                break
+
+            else:
+                _log(f"HTTP {r.status_code} {slug}")
+                break
+
+        except requests.exceptions.Timeout:
+            _log(f"TIMEOUT {slug} (pokušaj {attempt+1}/3)")
+            if attempt < 2:
+                time.sleep(1)
+            continue
+
+        except Exception as e:
+            _log(f"EXC {slug}: {type(e).__name__}: {e}")
+            if attempt < 2:
+                time.sleep(0.5)
+            continue
 
     if feed_akcije:
         return slug, "\n".join(feed_akcije)
@@ -853,6 +911,7 @@ with tab_scan:
         Path("_scan_done.txt").unlink(missing_ok=True)
         Path("_scan_result.json").unlink(missing_ok=True)
         Path("_scan_status.txt").write_text("🔄 Priprema skena...")
+        Path("_fetch_debug.log").unlink(missing_ok=True)  # briši stari log
         # Snimi cookie u fajl — threadovi ne vide session_state
         Path("_scan_cookie.txt").write_text(cookie or "")
 
@@ -1481,8 +1540,107 @@ Cookie traje ~24h.
 
     st.markdown("---")
     st.markdown("#### ⚙️ Podešavanja fetcha")
-    st.info(f"Trenutni broj paralelnih radnika: **{FETCH_WORKERS}**. "
-            "Ako dobijaš 429 greške, smanji `FETCH_WORKERS` u kodu (npr. na 5).")
+    st.info(
+        f"Paralelni threadovi: **{FETCH_WORKERS}** | "
+        f"Rate limit: **3 req/s** globalno | "
+        f"Max retry: **3x** na 429 (čeka 5–15s)"
+    )
+
+    # ── FETCH DEBUG LOG ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📋 Fetch Debug Log")
+    st.caption("Log svih grešaka iz poslednjeg skena — 429, auth greške, timeout, exceptions.")
+
+    lcol1, lcol2, lcol3 = st.columns(3)
+    with lcol1:
+        if st.button("🔄 Osveži log", key="refresh_log"):
+            st.rerun()
+    with lcol2:
+        if st.button("🗑️ Obriši log", key="clear_log"):
+            Path("_fetch_debug.log").unlink(missing_ok=True)
+            st.success("Log obrisan.")
+            st.rerun()
+    with lcol3:
+        auto_ref = st.checkbox("⏱️ Auto-refresh 3s", value=False, key="log_auto")
+
+    try:
+        log_txt = Path("_fetch_debug.log").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        log_txt = ""
+
+    if not log_txt.strip():
+        st.info("Log je prazan. Pokreni sken pa osvježi.")
+    else:
+        lines = [l for l in log_txt.strip().split("\n") if l.strip()]
+
+        # Grupiši po tipu
+        lines_429  = [l for l in lines if "429"      in l]
+        lines_auth = [l for l in lines if "AUTH"     in l]
+        lines_time = [l for l in lines if "TIMEOUT"  in l]
+        lines_exc  = [l for l in lines if "EXC"      in l or "PARSE ERR" in l]
+        lines_http = [l for l in lines if "HTTP"     in l and "429" not in l and "AUTH" not in l]
+
+        # Summary
+        c1, c2, c3, c4, c5 = st.columns(5)
+        for col, cnt, lbl, color in [
+            (c1, len(lines),       "Ukupno",     "#555"),
+            (c2, len(lines_429),   "⚠️ 429",     "#e67e22"),
+            (c3, len(lines_auth),  "🔐 Auth",    "#e74c3c"),
+            (c4, len(lines_time),  "⏱️ Timeout", "#8e44ad"),
+            (c5, len(lines_exc),   "💥 Exception","#c0392b"),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div style='background:#fff;border-radius:8px;padding:10px;
+                            text-align:center;border-top:3px solid {color};
+                            box-shadow:0 1px 4px rgba(0,0,0,0.08)'>
+                  <div style='font-size:1.6rem;font-weight:800;color:{color}'>{cnt}</div>
+                  <div style='font-size:.8rem;color:#888'>{lbl}</div>
+                </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if lines_auth:
+            st.error(f"🔐 **{len(lines_auth)} AUTH grešaka (401/403)** — cookie je istekao!")
+            with st.expander("Prikaži auth greške", expanded=True):
+                st.code("\n".join(lines_auth), language=None)
+
+        if lines_429:
+            st.warning(f"⚠️ **{len(lines_429)} puta 429 Too Many Requests**")
+            with st.expander(f"Prikaži 429 greške ({len(lines_429)})"):
+                st.code("\n".join(lines_429[-100:]), language=None)
+
+        if lines_time:
+            st.warning(f"⏱️ **{len(lines_time)} Timeout-a**")
+            with st.expander(f"Prikaži timeout greške ({len(lines_time)})"):
+                st.code("\n".join(lines_time), language=None)
+
+        if lines_exc:
+            st.error(f"💥 **{len(lines_exc)} Exceptions/Parse grešaka**")
+            with st.expander(f"Prikaži exceptions ({len(lines_exc)})"):
+                st.code("\n".join(lines_exc), language=None)
+
+        if lines_http:
+            with st.expander(f"Ostali HTTP kodovi ({len(lines_http)})"):
+                st.code("\n".join(lines_http), language=None)
+
+        if not any([lines_429, lines_auth, lines_time, lines_exc, lines_http]):
+            st.success("✅ Nema grešaka u logu!")
+
+        with st.expander("📄 Kompletni log (poslednjih 500 linija)"):
+            st.code("\n".join(lines[-500:]), language=None)
+
+        st.download_button(
+            "📥 Preuzmi log",
+            log_txt.encode("utf-8"),
+            "fetch_debug.log",
+            "text/plain",
+            key="dl_log"
+        )
+
+    if auto_ref:
+        time.sleep(3)
+        st.rerun()
 
     st.markdown("---")
     st.markdown("#### 🚫 Filtrirane akcije iz emaila")
