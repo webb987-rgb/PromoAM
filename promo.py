@@ -1,6 +1,7 @@
 import re
 import time
 import json
+import random
 import base64
 import datetime
 import smtplib
@@ -31,7 +32,7 @@ CITY_DISPLAY = {
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
-FETCH_WORKERS = 10
+FETCH_WORKERS = 4
 
 EMAIL_IGNORE_PROMOS = [
     "0 din delivery fee for 14 days",
@@ -410,6 +411,7 @@ def _fetch_url(ts, url: str, label: str, stop_event) -> tuple:
             return None, 0
         _wait_throttle()
         try:
+            time.sleep(random.uniform(0.3, 1.2))  # jitter pre svakog requesta
             r = ts.get(url, timeout=10)
             if r.status_code == 200:
                 return r.json(), 200
@@ -704,7 +706,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 break
 
             skip += 40
-            time.sleep(0.15)
+            time.sleep(random.uniform(0.5, 1.8))
 
         _update_city_progress(city_display, status=f"✅ Lokacija {loc_idx+1}/{len(multi_coords)} gotova ({len(restaurants)} ukupno)")
         _write_status_file()
