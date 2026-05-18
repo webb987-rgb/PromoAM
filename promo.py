@@ -54,14 +54,78 @@ SALES_FILE = Path("sales_baza.json")
 # ── Višestruke lokacije po gradu za kompletno pokrivanje ─────────────────────
 CITY_MULTI_COORDS = {
     "Beograd": [
-        (44.8178, 20.4569),  # centar
-        (44.7866, 20.4489),  # Voždovac
-        (44.8525, 20.3914),  # Zemun
-        (44.8010, 20.5132),  # Zvezdara
-        (44.8650, 20.6432),  # Pančevo granica
-        (44.7700, 20.3900),  # Rakovica
-        (44.8300, 20.5800),  # Palilula sever
+       (44.8610, 20.3450),  # Autoput Za Novi Sad 103, Beograd 11080
+    (44.8395, 20.3662),  # Dobanovački put 89, Beograd 11000
+    (44.8492, 20.3831),  # Banatska 31, Beograd
+    (44.8361, 20.3828),  # Ševina 54, Beograd 11000
+    (44.8430, 20.3955),  # Ugrinovačka 74, Beograd
+    (44.8225, 20.3995),  # Tošin bunar 128, Beograd 11000
+    (44.8251, 20.4102),  # Omladinskih brigada 16, Beograd 11070
+    (44.8152, 20.3798),  # Generala Mihajla Nedeljkovića 5, Beograd
+    (44.8188, 20.4075),  # Omladinskih brigada 31, Beograd 11070
+    (44.8130, 20.4182),  # Bulevar Zorana Đinđića 59, Novi Beograd 11070
+    (44.8255, 20.4571),  # Skenderbegova 3, Beograd 11000
+    (44.8180, 20.4522),  # Kralja Petra 8, Beograd 11000
+    (44.8160, 20.4735),  # Bulevar despota Stefana 99, Beograd 137003
+    (44.8115, 20.4651),  # Vlajkovićeva 15, Beograd 11000
+    (44.8142, 20.4870),  # Mije Kovačevića 3, Beograd 11000
+    (44.8001, 20.4705),  # Katanićeva 24, Beograd 11000
+    (44.8042, 20.4521),  # Savska 21, Beograd 111106
+    (44.7932, 20.4800),  # Južni bulevar 142, Beograd
+    (44.8145, 20.4990),  # Dragoslava Srejovića 26c, Beograd 11000
+    (44.8175, 20.5182),  # Višnjička 130, Beograd 11060
+    (44.8160, 20.4950),  # Višnjička 17b, Beograd 11060
+    (44.8080, 20.4905),  # Veljka Dugoševića 19, Beograd 11051
+    (44.8045, 20.4820),  # Ćirila i Metodija 2, Beograd 11000
+    (44.8048, 20.4825),  # Novice Cerovića 3, Beograd 11050
+    (44.7960, 20.4960),  # Bulevar kralja Aleksandra 297, Beograd 11050
+    (44.7925, 20.4430),  # Bulevar vojvode Putnika 36, Beograd 11000
+    (44.7870, 20.4660),  # Ustanička 11, Beograd 11118
+    (44.7865, 20.4860),  # Ustanička 125E, Beograd 11000
+    (44.7920, 20.4350),  # Bulevar vojvode Mišića 85, Beograd
+    (44.7820, 20.4550),  # Šekspirova 8, Beograd
+    (44.7760, 20.4180),  # Požeška 58, Beograd
+    (44.7700, 20.4800),  # Biljane Jovanović 2s, Beograd
+    (44.7850, 20.5350),  # Vitezova Karađorđeve zvezde 91, Beograd
+    (44.7500, 20.4100),  # Slavonskih Brigada 19, Beograd 11030
+    (44.7850, 20.5400),  # Vaska Pope 10, Beograd
+    (44.7620, 20.4850),  # Braće Jerković 74e, Beograd 11010
+    (44.7580, 20.4900),  # Svetozara Radojčića 64, Beograd
+    (44.7580, 20.4850),  # Bulevar Peka Dapčevića 39a, Beograd
+    (44.7720, 20.4350),  # Bulevar Patrijarha Pavla 4v, Beograd
+    (44.7600, 20.4750),  # Crnotravska 17, Beograd 11040
+    (44.7975, 20.4650),  # Avalska 2
+    (44.7380, 20.4450),  # Kneževačka 13
+    (44.7400, 20.4700),  # Bulevar JNA 100
+    (44.7900, 20.5300),  # Živka Jovanovića 1
+    (44.8100, 20.5100),  # Mirijevska 10
+    (44.7880, 20.5300),  # Matice srpske 100
+    (44.7950, 20.3500),  # Vojvođanska 430
+    (44.8050, 20.3880),  # Nehruova 50
+    (44.8070, 20.4100),  # Jurija Gagarina 14
+    (44.8130, 20.4350),  # Milentija Popovića 4
+    (44.8520, 20.3400),  # Jurija Rakitina 1
+    (44.7500, 20.4100),  # Palisadska 3
+    (44.7500, 20.4150),  # Megarska 9
+    (44.7500, 20.4900),  # Milovana Vidakovića 17
+    (44.7600, 20.4850),  # Dušana Jovanovića 10
+    (44.7600, 20.4900),  # Marka Stojkovića 4
+    (44.7550, 20.4150),  # Ratka Mitrovića 126
+    (44.7620, 20.4200),  # Kneza Višeslava 124
+    (44.8450, 20.3700),  # Autoput za Novi Sad 20
+    (44.8400, 20.4100),  # Masarikov trg 6
+    (44.8150, 20.4250),  # Bulevar Mihajla Pupina 6a
+    (44.8100, 20.4350),  # Vladimira Popovića 40
+    (44.7550, 20.4100),  # Ace Joksimovića 2B, Beograd
+    (44.8350, 20.3800),  # Branka Plećaša 10
+    (44.8180, 20.4620),  # Francuska 10
+    (44.8080, 20.4630),  # Kralja Milana 10
+    (44.8150, 20.5250),  # Slanački put 76a
+    (44.7850, 20.5400),  # Mihaila Bulgakova 52
+    (44.7700, 20.4100),  # Jana Kolara 3
+    (44.8030, 20.4680),  # Njegoševa 30
     ],
+    
     "Novi Sad": [
         (45.2671, 19.8335),  # centar
         (45.2500, 19.8100),  # Liman
