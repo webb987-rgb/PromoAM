@@ -49,6 +49,7 @@ ALERT_FILE = Path("alert_log.csv")
 ALERT_COLS = ["timestamp", "city", "restaurant_display", "am_name", "am_email", "akcije"]
 
 SCAN_FILE  = Path("scan_baza_item.json")
+SALES_FILE = Path("sales_baza.json")
 
 # ── Višestruke lokacije po gradu za kompletno pokrivanje ─────────────────────
 CITY_MULTI_COORDS = {
@@ -313,6 +314,55 @@ def load_scan() -> pd.DataFrame:
 def scan_meta() -> str | None:
     return scan_meta_github()
 
+def load_sales() -> dict:
+    """Učitava sales bazu — dict {grad: [email1, email2, ...]}"""
+    # Pokušaj GitHub
+    content = github_read("sales_baza.json")
+    if content:
+        try:
+            return json.loads(content)
+        except Exception:
+            pass
+    # Lokalno
+    if SALES_FILE.exists():
+        try:
+            return json.loads(SALES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # Default prazan
+    return {city: [] for city in CITIES}
+
+def save_sales(data: dict):
+    """Čuva sales bazu na GitHub i lokalno."""
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    github_write("sales_baza.json", content, "sales: update")
+    SALES_FILE.write_text(content, encoding="utf-8")
+
+def notify_sales_new_restaurant(slug: str, naziv: str, grad: str, sales_data: dict, send_email_fn):
+    """
+    Šalje mail sales agentima zaduženim za grad kada se detektuje
+    novi restoran bez definisanog AM-a.
+    """
+    emails = sales_data.get(grad, [])
+    if not emails:
+        return
+    wolt_link = f"https://wolt.com/sr/srb/{grad.lower().replace(' ', '-')}/restaurant/{slug}"
+    subject = f"🆕 Novi restoran na Woltu — {naziv} ({grad})"
+    body = (
+        f"Zdravo,\n\n"
+        f"Detektovan je novi restoran na Wolt platformi koji nema dodeljenog Account Managera:\n\n"
+        f"🏪 Restoran: {naziv}\n"
+        f"📍 Grad: {grad}\n"
+        f"🔗 Link: {wolt_link}\n\n"
+        f"Molimo dodelite odgovornog AM-a što pre.\n\n"
+        f"— Promo Monitor"
+    )
+    for email in emails:
+        try:
+            send_email_fn(email, subject, body)
+        except Exception as e:
+            _log_fetch(f"SALES MAIL greška → {email}: {e}")
+
 # ─────────────────────────── KEEP-ALIVE PING ─────────────────────────────────
 
 def _keepalive_loop():
@@ -387,9 +437,10 @@ _throttle_lock  = threading.Lock()
 
 def _log_fetch(msg: str):
     try:
+        ts = datetime.now().strftime("%H:%M:%S")
         with _fetch_log_lock:
             with open("_fetch_debug.log", "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
+                f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
 
@@ -959,6 +1010,55 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
         st.error(f"Email greška ({am_email}): {e}")
         return False
 
+def send_sales_notification(to_email: str, naziv: str, grad: str, slug: str) -> bool:
+    """Šalje obaveštenje sales agentu o novom restoranu bez AM-a."""
+    try:
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        wolt_link = f"https://wolt.com/sr/srb/{grad.lower().replace(' ', '-')}/restaurant/{slug}"
+        html = f"""
+        <html><body style='font-family:Arial,sans-serif;background:#f5f5f5;padding:20px'>
+          <div style='max-width:560px;margin:auto;background:#fff;border-radius:12px;
+                      padding:28px;box-shadow:0 2px 8px rgba(0,0,0,0.08)'>
+            <div style='background:#009de0;color:#fff;padding:16px 20px;border-radius:8px;
+                        margin-bottom:20px;font-size:1.2rem;font-weight:700'>
+              🆕 Novi restoran na Woltu
+            </div>
+            <p style='font-size:1rem;color:#333'>
+              Detektovan je novi restoran koji nema dodeljenog Account Managera:
+            </p>
+            <table style='width:100%;border-collapse:collapse;margin:16px 0'>
+              <tr>
+                <td style='padding:10px;background:#f9f9f9;font-weight:700;width:35%'>🏪 Restoran</td>
+                <td style='padding:10px'>{naziv}</td>
+              </tr>
+              <tr>
+                <td style='padding:10px;background:#f9f9f9;font-weight:700'>📍 Grad</td>
+                <td style='padding:10px'>{grad}</td>
+              </tr>
+              <tr>
+                <td style='padding:10px;background:#f9f9f9;font-weight:700'>🔗 Wolt link</td>
+                <td style='padding:10px'><a href='{wolt_link}' style='color:#009de0'>{wolt_link}</a></td>
+              </tr>
+            </table>
+            <p style='color:#666;font-size:0.9rem'>Molimo dodelite odgovornog AM-a što pre.</p>
+            <p style='font-size:11px;color:#999;margin-top:20px'>Automatski izveštaj &bull; Promo Monitor</p>
+          </div>
+        </body></html>"""
+        msg = MIMEMultipart("alternative")
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = to_email
+        msg["Subject"] = f"🆕 Novi restoran — {naziv} ({grad})"
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP("smtp.gmail.com", 587) as srv:
+            srv.starttls()
+            srv.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            srv.sendmail(EMAIL_SENDER, to_email, msg.as_string())
+        return True
+    except Exception as e:
+        _log_fetch(f"SALES MAIL greška → {to_email}: {e}")
+        return False
+
 # ─────────────────────────── AUTO-SCHEDULER ──────────────────────────────────
 
 SCHEDULER_FILE = Path("scheduler_config.json")
@@ -1076,19 +1176,22 @@ if "scan_start_time" not in st.session_state:
     st.session_state.scan_start_time = None
 if "scan_mode" not in st.session_state:
     st.session_state.scan_mode = "full"
+if "scan_duration_last" not in st.session_state:
+    st.session_state.scan_duration_last = None
 
 # ─────────────────────────── UI ──────────────────────────────────────────────
 
 st.title("🏷️ Promo Monitor – Item Level")
 st.caption("Skenira item-level popuste: ulazi u svaki restoran i proverava da li ima makar jedan snižen proizvod.")
 
-tab_scan, tab_amm, tab_alert, tab_stats, tab_sched, tab_debug = st.tabs([
+tab_scan, tab_amm, tab_alert, tab_stats, tab_sched, tab_debug, tab_reset = st.tabs([
     "🔍 Scan & Rezultati",
     "👥 AMM Baza",
     "📧 Pošalji Alert",
     "📈 Statistika",
     "⏰ Auto-Scheduler",
     "🔧 Debug API",
+    "🗑️ Reset & Backup",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1293,7 +1396,7 @@ with tab_scan:
                     </div>
                     """, unsafe_allow_html=True)
 
-        time.sleep(2)
+        time.sleep(3)
         st.rerun()
 
     # Prikaz rezultata kad scan završi
@@ -1311,7 +1414,32 @@ with tab_scan:
         if df_result is not None and not df_result.empty:
             st.session_state.df_wolt = df_result
             st.session_state.last_scan = local_now()
+            st.session_state.scan_duration_last = scan_duration
             save_scan(df_result)
+
+            # ── Obavesti sales o novim restoranima bez AM-a ───────────────
+            novi_df = df_result[df_result["novo"] == "Da"] if "novo" in df_result.columns else pd.DataFrame()
+            if not novi_df.empty:
+                amm_check = load_amm()
+                sales_cfg  = load_sales()
+                notified   = 0
+                for _, row in novi_df.iterrows():
+                    naziv = row.get("naziv", "")
+                    grad  = row.get("grad", "")
+                    slug  = row.get("slug", "")
+                    norm  = normalize(naziv)
+                    # Ima li AM?
+                    has_am = not amm_check[
+                        (amm_check["restaurant_norm"] == norm) &
+                        (amm_check["city"] == grad)
+                    ].empty if not amm_check.empty else False
+                    if not has_am:
+                        emails = sales_cfg.get(grad, [])
+                        for email in emails:
+                            send_sales_notification(email, naziv, grad, slug)
+                            notified += 1
+                if notified:
+                    st.info(f"📬 Poslato **{notified}** obaveštenja sales agentima o novim restoranima.")
             m, s = divmod(int(scan_duration), 60)
             scan_mode_done = st.session_state.get("scan_mode", "full")
             if scan_mode_done == "nopromo":
@@ -1335,6 +1463,15 @@ with tab_scan:
 
     df = st.session_state.df_wolt
     if not df.empty:
+        # Timer banner
+        if st.session_state.scan_duration_last:
+            m_t, s_t = divmod(int(st.session_state.scan_duration_last), 60)
+            st.markdown(
+                f"<div style='background:#e8f8f0;border-left:4px solid #27ae60;padding:8px 16px;"
+                f"border-radius:6px;margin-bottom:12px;font-size:0.95rem;color:#155724'>"
+                f"⏱️ Poslednji sken trajao: <strong>{m_t:02d}:{s_t:02d}</strong></div>",
+                unsafe_allow_html=True,
+            )
         st.markdown("---")
 
         k1, k2, k3, k4, k5, k6 = st.columns(6)
@@ -1499,7 +1636,100 @@ with tab_amm:
     amm_df  = load_amm()
     df_wolt = st.session_state.df_wolt
 
-    st.markdown("#### ➕ Dodaj / ažuriraj")
+    # ── Sales agenti po gradu ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📬 Sales agenti po gradu")
+    st.caption("Kada se detektuje novi restoran bez AM-a, automatski se šalje obaveštenje sales agentu zaduženom za taj grad.")
+
+    sales_data = load_sales()
+    sales_changed = False
+
+    for city in CITIES:
+        emails_current = sales_data.get(city, [])
+        emails_str = ", ".join(emails_current)
+        col_city, col_email, col_save = st.columns([1, 3, 1])
+        with col_city:
+            st.markdown(f"**{city}**")
+        with col_email:
+            new_emails_str = st.text_input(
+                f"Email(ovi) za {city}:",
+                value=emails_str,
+                placeholder="sales@firma.com, sales2@firma.com",
+                key=f"sales_email_{city}",
+                label_visibility="collapsed",
+            )
+        with col_save:
+            if st.button("💾", key=f"sales_save_{city}", help=f"Sačuvaj za {city}"):
+                parsed = [e.strip() for e in new_emails_str.split(",") if e.strip()]
+                sales_data[city] = parsed
+                save_sales(sales_data)
+                st.success(f"✅ {city}: {len(parsed)} email(a) sačuvano.")
+                st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### ⚡ Bulk dodela — čekiraj restorane i dodeli AM-a")
+
+    if df_wolt.empty:
+        st.info("Pokreni scan prvo da bi se restorani prikazali.")
+    else:
+        bulk_am_opts = sorted(amm_df["am_name"].dropna().unique().tolist()) if not amm_df.empty else []
+        if not bulk_am_opts:
+            st.warning("Nema AM-ova u bazi. Dodaj AM-a gore pa se vrati ovde.")
+        else:
+            b_col1, b_col2 = st.columns([1, 3])
+            with b_col1:
+                bulk_selected_am = st.selectbox("Izaberi Account Managera:", bulk_am_opts, key="bulk_am_sel")
+            with b_col2:
+                bulk_grad = st.multiselect("Filtriraj po gradu:", CITIES, default=CITIES, key="bulk_grad_filt")
+
+            if bulk_selected_am:
+                am_row = amm_df[amm_df["am_name"] == bulk_selected_am].iloc[0]
+                am_email_bulk = am_row["am_email"]
+
+                bulk_df = df_wolt[df_wolt["grad"].isin(bulk_grad)][["naziv", "grad"]].drop_duplicates().copy()
+                bulk_df["✅ Dodeli"] = False
+                # Označi već dodeljene
+                already = amm_df[amm_df["am_name"] == bulk_selected_am]["restaurant_display"].tolist()
+                bulk_df["✅ Dodeli"] = bulk_df["naziv"].isin(already)
+
+                edited_bulk = st.data_editor(
+                    bulk_df.reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=400,
+                    column_config={
+                        "✅ Dodeli": st.column_config.CheckboxColumn("Dodeli ovom AM-u", default=False),
+                        "naziv":     st.column_config.TextColumn("Restoran", disabled=True),
+                        "grad":      st.column_config.TextColumn("Grad", disabled=True),
+                    },
+                    key="bulk_editor",
+                )
+
+                if st.button("💾 Sačuvaj bulk dodelu", key="bulk_save", use_container_width=False):
+                    selected_rows = edited_bulk[edited_bulk["✅ Dodeli"] == True]
+                    new_rows = []
+                    for _, row in selected_rows.iterrows():
+                        norm = normalize(row["naziv"])
+                        city_v = row["grad"]
+                        mask = (amm_df["restaurant_norm"] == norm) & (amm_df["city"] == city_v)
+                        if mask.any():
+                            amm_df.loc[mask, ["am_name", "am_email"]] = [bulk_selected_am, am_email_bulk]
+                        else:
+                            new_rows.append({
+                                "restaurant_norm":    norm,
+                                "restaurant_display": row["naziv"],
+                                "city":               city_v,
+                                "am_name":            bulk_selected_am,
+                                "am_email":           am_email_bulk,
+                            })
+                    if new_rows:
+                        amm_df = pd.concat([amm_df, pd.DataFrame(new_rows)], ignore_index=True)
+                    save_amm(amm_df)
+                    st.success(f"✅ Dodeljeno {len(selected_rows)} restorana → {bulk_selected_am}")
+                    st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### ➕ Dodaj / ažuriraj pojedinačno")
 
     rest_options = sorted(df_wolt["naziv"].dropna().unique().tolist()) if not df_wolt.empty else []
 
@@ -2030,24 +2260,144 @@ Cookie traje ~24h.
         if log_content.strip():
             lines = log_content.strip().split("\n")
             st.markdown(f"**{len(lines)} linija u logu**")
-            auth_fails = [l for l in lines if "auth fail" in l]
-            no_akcija  = [l for l in lines if "NEMA akcija" in l]
-            errors     = [l for l in lines if "EXC" in l or "→ 4" in l or "→ 5" in l]
-            if auth_fails:
-                st.error(f"🔐 **{len(auth_fails)} auth grešaka (401/403)** — cookie možda istekao!")
-                with st.expander(f"Auth greške ({len(auth_fails)})"):
-                    st.text("\n".join(auth_fails[:50]))
-            if no_akcija:
-                st.warning(f"🔍 **{len(no_akcija)} restorana sa 200 ali bez akcija**")
-                with st.expander(f"Bez akcija ({len(no_akcija)})"):
-                    st.text("\n".join(no_akcija[:100]))
-            if errors:
-                st.warning(f"⚠️ **{len(errors)} ostalih grešaka**")
-                with st.expander(f"Ostale greške ({len(errors)})"):
-                    st.text("\n".join(errors[:50]))
-            if not auth_fails and not no_akcija and not errors:
-                st.success("✅ Nema grešaka u logu!")
+
+            # Filteri
+            lf1, lf2 = st.columns([1, 2])
+            with lf1:
+                log_type_filter = st.selectbox("Tip greške:", [
+                    "Sve", "429 (Rate limit)", "401/403 (Auth)", "EXC (Exception)", "Bez akcija", "Samo uspešne"
+                ], key="log_type_filt")
+            with lf2:
+                log_search = st.text_input("Pretraži log (naziv restorana):", key="log_search", placeholder="npr. omega-rostilj")
+
+            def filter_lines(lines, ftype, search):
+                if ftype == "429 (Rate limit)":
+                    lines = [l for l in lines if "429" in l]
+                elif ftype == "401/403 (Auth)":
+                    lines = [l for l in lines if "auth fail" in l or "401" in l or "403" in l]
+                elif ftype == "EXC (Exception)":
+                    lines = [l for l in lines if "EXC" in l]
+                elif ftype == "Bez akcija":
+                    lines = [l for l in lines if "NEMA akcija" in l]
+                elif ftype == "Samo uspešne":
+                    lines = [l for l in lines if "sniženje" in l.lower()]
+                if search.strip():
+                    lines = [l for l in lines if search.strip().lower() in l.lower()]
+                return lines
+
+            filtered = filter_lines(lines, log_type_filter, log_search)
+            st.caption(f"Prikazano: **{len(filtered)}** / {len(lines)} linija")
+
+            if filtered:
+                st.code("\n".join(filtered[-200:]), language=None)
+            else:
+                st.info("Nema linija koje odgovaraju filteru.")
         else:
             st.info("Log je prazan. Pokreni sken pa osvježi.")
     except FileNotFoundError:
         st.info("Log fajl ne postoji. Pokreni sken pa osvježi.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7: RESET & BACKUP
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_reset:
+    st.markdown("### 🗑️ Reset sistema")
+    st.caption("Sve reset operacije zahtevaju lozinku za potvrdu.")
+
+    RESET_PASSWORD = "zekapeka"
+
+    import zipfile as _zipfile
+
+    st.markdown("---")
+    st.markdown("#### 💾 Backup — preuzmi sve podatke")
+    if st.button("📦 Kreiraj backup (ZIP)", key="backup_btn"):
+        import io as _io
+        zip_buf = _io.BytesIO()
+        files_to_backup = [
+            ("scan_baza_item.json", SCAN_FILE),
+            ("amm_baza.csv",        AMM_FILE),
+            ("alert_log.csv",       ALERT_FILE),
+            ("fetch_debug.log",     Path("_fetch_debug.log")),
+            ("scheduler_config.json", SCHEDULER_FILE),
+        ]
+        with _zipfile.ZipFile(zip_buf, "w", _zipfile.ZIP_DEFLATED) as zf:
+            for arcname, fpath in files_to_backup:
+                if Path(fpath).exists():
+                    zf.write(fpath, arcname)
+            # Uključi i session scan rezultate
+            if not st.session_state.df_wolt.empty:
+                zf.writestr(
+                    "scan_rezultati_export.csv",
+                    st.session_state.df_wolt.to_csv(index=False)
+                )
+        zip_buf.seek(0)
+        ts_now = datetime.now().strftime("%Y%m%d_%H%M")
+        st.download_button(
+            "⬇️ Preuzmi backup.zip",
+            zip_buf,
+            file_name=f"promo_backup_{ts_now}.zip",
+            mime="application/zip",
+            key="backup_dl"
+        )
+
+    st.markdown("---")
+    st.markdown("#### ⚠️ Reset operacije")
+    st.warning("Sve operacije ispod su **nepovratne**. Unesite lozinku da potvrdite.")
+
+    reset_pass = st.text_input("🔑 Lozinka:", type="password", key="reset_pass_input")
+    pass_ok = reset_pass == RESET_PASSWORD
+
+    r1, r2, r3, r4 = st.columns(4)
+
+    with r1:
+        st.markdown("**Reset logova**")
+        st.caption("Briše fetch debug log.")
+        if st.button("🗑️ Obriši logove", key="reset_logs", disabled=not pass_ok):
+            Path("_fetch_debug.log").unlink(missing_ok=True)
+            st.success("✅ Logovi obrisani.")
+
+    with r2:
+        st.markdown("**Reset baze restorana**")
+        st.caption("Briše AMM bazu (ko je čiji account).")
+        if st.button("🗑️ Obriši AMM bazu", key="reset_amm", disabled=not pass_ok):
+            empty_amm = pd.DataFrame(columns=["restaurant_norm","restaurant_display","city","am_name","am_email"])
+            save_amm(empty_amm)
+            st.success("✅ AMM baza obrisana.")
+
+    with r3:
+        st.markdown("**Reset scan rezultata**")
+        st.caption("Briše poslednji scan iz memorije i fajla.")
+        if st.button("🗑️ Obriši scan", key="reset_scan", disabled=not pass_ok):
+            st.session_state.df_wolt = pd.DataFrame()
+            st.session_state.last_scan = None
+            st.session_state.scan_duration_last = None
+            SCAN_FILE.unlink(missing_ok=True)
+            Path("_scan_result.json").unlink(missing_ok=True)
+            Path("_scan_done.txt").unlink(missing_ok=True)
+            Path("_scan_status.txt").unlink(missing_ok=True)
+            st.success("✅ Scan rezultati obrisani.")
+            st.rerun()
+
+    with r4:
+        st.markdown("**Reset SVE**")
+        st.caption("Briše apsolutno sve podatke.")
+        if st.button("💥 RESET SVE", key="reset_all", type="primary", disabled=not pass_ok):
+            # Scan
+            st.session_state.df_wolt = pd.DataFrame()
+            st.session_state.last_scan = None
+            st.session_state.scan_duration_last = None
+            for f in ["_scan_result.json","_scan_done.txt","_scan_status.txt",
+                      "_scan_city_progress.json","_fetch_debug.log"]:
+                Path(f).unlink(missing_ok=True)
+            SCAN_FILE.unlink(missing_ok=True)
+            # AMM
+            empty_amm = pd.DataFrame(columns=["restaurant_norm","restaurant_display","city","am_name","am_email"])
+            save_amm(empty_amm)
+            # Alert log
+            empty_alert = pd.DataFrame(columns=["timestamp","restaurant","city","am_name","am_email","akcije"])
+            save_alert_log(empty_alert)
+            st.success("💥 Sve obrisano!")
+            st.rerun()
+
+    if reset_pass and not pass_ok:
+        st.error("❌ Pogrešna lozinka.")
