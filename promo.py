@@ -196,6 +196,8 @@ def _gh_api(method: str, path: str, payload: dict = None):
                              json=payload, timeout=15)
         return r
     except Exception as e:
+        import streamlit as st
+        st.error(f"🔍 Detaljna sistemska greška: {e}")
         return None
 
 def github_read(path: str) -> str | None:
