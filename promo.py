@@ -19,7 +19,7 @@ from pathlib import Path
 EMAIL_SENDER   = "webb987@gmail.com"
 EMAIL_PASSWORD = "sdehqzbnqefjlomo"
 
-GITHUB_TOKEN = "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"
+GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
 GITHUB_REPO  = "webb987-rgb/PromoAM"
 GITHUB_BRANCH = "main"
 
