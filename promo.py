@@ -87,6 +87,13 @@ CITY_MULTI_COORDS = {
 # Primarna koordinata (prva u listi) za svaki grad
 CITY_COORDS = {k: v[0] for k, v in CITY_MULTI_COORDS.items()}
 
+# ── Custom koordinate iz UI-ja (override CITY_MULTI_COORDS) ──────────────────
+def get_active_coords() -> dict:
+    """Vraća koordinate – custom iz session_state ako postoje, inače CITY_MULTI_COORDS."""
+    if "custom_coords" in st.session_state:
+        return st.session_state["custom_coords"]
+    return CITY_MULTI_COORDS
+
 # ─────────────────────────── PAGE CONFIG ─────────────────────────────────────
 
 st.set_page_config(page_title="Promo Monitor – Item Level", page_icon="🏷️", layout="wide")
@@ -673,7 +680,7 @@ def _update_city_progress(city_display: str, found: int = None, total: int = Non
 def fetch_city(city_display: str, status_placeholder, stop_event: threading.Event) -> list[dict]:
     city_key  = display_to_key(city_display)
     city_slug = CITY_SLUG_MAP.get(city_key)
-    multi_coords = CITY_MULTI_COORDS.get(city_key, [CITY_COORDS.get(city_key, (44.8178, 20.4569))])
+    multi_coords = get_active_coords().get(city_key, CITY_MULTI_COORDS.get(city_key, [CITY_COORDS.get(city_key, (44.8178, 20.4569))]))
     primary_lat, primary_lon = multi_coords[0]
 
     if not city_slug:
@@ -1479,7 +1486,7 @@ with tab_scan:
         sa_akcijama    = len(df[df["akcije"] != "-"])
         otvoreni       = len(df[df["status"] == "Otvoren"])
         novi           = len(df[df["novo"] == "Da"])
-        sa_wolt_plus   = len(df[df["akcije"].str.contains("[Wolt+]", na=False, regex=False)])
+        sa_wolt_plus   = len(df[df["akcije"].apply(lambda c: bool(re.search(r'\[Wolt\+\]|Wolt\+|W\+', c, re.IGNORECASE)) if pd.notna(c) else False)])
         sa_snizenjem   = len(df[df["akcije"].str.contains("[Sniženje", na=False, regex=False)])
 
         for col, val, lbl in [
@@ -1545,6 +1552,11 @@ with tab_scan:
         with fc7:
             samo_snizeni = st.checkbox("🏷️ Samo sa sniženim artiklima", value=False, key="scan_snizeni")
 
+        fc8, fc9, _ = st.columns(3)
+        with fc8:
+            samo_pct_popust = st.checkbox("🔢 Samo sa % popustom", value=False, key="scan_pct_popust",
+                                           help="Prikazuje restorane koji u akcijama imaju bilo koji procentualni popust (npr. 10%, 30%...)")
+
         sve_akcije_tekst = sorted(set(
             line.lstrip("• ").strip()
             for akcije_cell in df["akcije"]
@@ -1575,13 +1587,20 @@ with tab_scan:
             )
             fdf = fdf[mask]
         if samo_wolt_plus:
-            fdf = fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)]
+            # Hvata [Wolt+], Wolt+, W+ varijante
+            mask_wp = fdf["akcije"].apply(
+                lambda cell: bool(re.search(r'\[Wolt\+\]|Wolt\+|W\+', cell, re.IGNORECASE)) if cell != "-" else False
+            )
+            fdf = fdf[mask_wp]
+        if samo_pct_popust:
+            # Hvata bilo koji % u tekstu akcije
+            fdf = fdf[fdf["akcije"].str.contains(r'\d+\s*%', na=False, regex=True)]
         if samo_snizeni:
             fdf = fdf[fdf["akcije"].str.contains("[Sniženje", na=False, regex=False)]
 
         total_fdf  = len(fdf)
         sa_ak      = len(fdf[fdf["akcije"] != "-"])
-        sa_wplus   = len(fdf[fdf["akcije"].str.contains("[Wolt+]", na=False, regex=False)])
+        sa_wplus   = len(fdf[fdf["akcije"].apply(lambda c: bool(re.search(r'\[Wolt\+\]|Wolt\+|W\+', c, re.IGNORECASE)) if pd.notna(c) else False)])
         sa_sniz    = len(fdf[fdf["akcije"].str.contains("[Sniženje", na=False, regex=False)])
         sa_novi_f  = len(fdf[fdf["novo"] == "Da"])
         sa_otv     = len(fdf[fdf["status"] == "Otvoren"])
@@ -2125,7 +2144,14 @@ with tab_debug:
         if r_test and r_test.status_code == 200:
             st.success("✅ GitHub konekcija OK")
         else:
-            st.error(f"❌ GitHub greška: {r_test.status_code if r_test else 'timeout'}")
+            status_code = r_test.status_code if r_test else "timeout"
+            st.error(f"❌ GitHub greška: {status_code}")
+            st.caption(
+                "⚠️ Ako si na Streamlit Cloud — odlazni HTTP ka api.github.com može biti blokiran "
+                "od strane platforme. Rešenje: koristi **Secrets** za token i proveri da li je "
+                "`egress` ka `api.github.com` dozvoljen u podešavanjima. "
+                "Podaci se u međuvremenu čuvaju lokalno."
+            )
     with gh_col2:
         if st.button("🔄 Sync AMM sa GitHub-a", key="sync_amm"):
             amm_fresh = load_amm_github()
@@ -2163,13 +2189,89 @@ Cookie traje ~24h.
         session.headers["Cookie"] = st.session_state["wolt_cookie"]
 
     st.markdown("---")
-    st.markdown("#### 📍 Lokacije po gradu (višestruko skeniranje)")
-    st.info("Svaki grad se skenira sa više geografskih tačaka da bi se pokrili svi restorani.")
-    for city_key, coords_list in CITY_MULTI_COORDS.items():
+    st.markdown("#### 📍 Lokacije po gradu — editabilne koordinate")
+    st.info("Svaki grad se skenira sa više geografskih tačaka. Možeš dodavati/menjati/brisati lokacije ručno.")
+
+    # Inicijalizuj custom_coords iz session_state ili default
+    if "custom_coords" not in st.session_state:
+        st.session_state["custom_coords"] = {
+            k: list(v) for k, v in CITY_MULTI_COORDS.items()
+        }
+
+    for city_key in CITY_KEYS:
         city_disp = CITY_DISPLAY.get(city_key, city_key)
-        with st.expander(f"📍 {city_disp} – {len(coords_list)} lokacija"):
-            for i, (lat, lon) in enumerate(coords_list):
-                st.markdown(f"  **Lok. {i+1}:** lat={lat}, lon={lon}")
+        coords_list = st.session_state["custom_coords"].get(city_key, [])
+
+        with st.expander(f"📍 {city_disp} — {len(coords_list)} lokacija", expanded=False):
+            st.caption("Format: svaki red = jedna lokacija. Upiši `lat, lon` (decimalni zarez ili tačka).")
+
+            # Tekstualni unos — svaki red jedna koordinata
+            coords_text = "\n".join(f"{lat}, {lon}" for lat, lon in coords_list)
+            new_text = st.text_area(
+                f"Koordinate za {city_disp}:",
+                value=coords_text,
+                height=max(120, len(coords_list) * 35 + 40),
+                placeholder="44.8178, 20.4569\n44.7866, 20.4489\n...",
+                key=f"coords_input_{city_key}",
+                label_visibility="collapsed",
+            )
+
+            col_save_c, col_reset_c = st.columns([1, 1])
+            with col_save_c:
+                if st.button(f"💾 Sačuvaj koordinate", key=f"save_coords_{city_key}"):
+                    parsed_coords = []
+                    errors = []
+                    for i, line in enumerate(new_text.strip().split("\n")):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            parts = [p.strip().replace(",", ".") for p in line.replace(";", ",").split(",")]
+                            if len(parts) >= 2:
+                                lat_v = float(parts[0])
+                                lon_v = float(parts[1])
+                                if -90 <= lat_v <= 90 and -180 <= lon_v <= 180:
+                                    parsed_coords.append((lat_v, lon_v))
+                                else:
+                                    errors.append(f"Red {i+1}: koordinate van opsega ({lat_v}, {lon_v})")
+                            else:
+                                errors.append(f"Red {i+1}: format nije `lat, lon`")
+                        except ValueError:
+                            errors.append(f"Red {i+1}: nije broj — '{line}'")
+
+                    if errors:
+                        for err in errors:
+                            st.error(err)
+                    elif not parsed_coords:
+                        st.error("Nema validnih koordinata.")
+                    else:
+                        st.session_state["custom_coords"][city_key] = parsed_coords
+                        st.success(f"✅ {len(parsed_coords)} lokacija sačuvano za {city_disp}.")
+
+            with col_reset_c:
+                if st.button(f"↩️ Vrati default", key=f"reset_coords_{city_key}"):
+                    st.session_state["custom_coords"][city_key] = list(CITY_MULTI_COORDS[city_key])
+                    st.success(f"↩️ Resetovano na {len(CITY_MULTI_COORDS[city_key])} default lokacija.")
+                    st.rerun()
+
+            # Prikaz trenutnih aktivnih koordinata
+            active = st.session_state["custom_coords"].get(city_key, [])
+            if active:
+                st.markdown("**Trenutno aktivne lokacije:**")
+                for i, (lat, lon) in enumerate(active):
+                    st.markdown(
+                        f"<span style='font-family:monospace;font-size:0.85rem;color:#009de0'>"
+                        f"  Lok. {i+1}: lat={lat}, lon={lon}</span>",
+                        unsafe_allow_html=True
+                    )
+
+    st.markdown("---")
+    st.markdown("**ℹ️ Kako koristiti custom koordinate:**")
+    st.caption(
+        "Promene se primenjuju odmah pri sledećem skenu. "
+        "Koordinate se čuvaju u sesiji — resetuju se pri ponovnom pokretanju aplikacije. "
+        "Za trajno čuvanje, exportuj koordinate i unesi ih ponovo."
+    )
 
     st.markdown("---")
     st.markdown("#### ⚙️ Podešavanja fetcha")
