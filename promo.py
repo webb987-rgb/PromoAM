@@ -136,6 +136,7 @@ def get_sheet(tab_name: str):
     except gspread.exceptions.WorksheetNotFound:
         return sh.add_worksheet(title=tab_name, rows=1000, cols=20)
 
+
 # ─────────────────────────── HELPERS ─────────────────────────────────────────
 
 def normalize(name: str) -> str:
@@ -170,47 +171,68 @@ def filter_akcije_for_email(akcije_str: str) -> str:
     return "\n".join(filtered) if filtered else "-"
 
 # ─────────────────────────── GOOGLE SHEETS PERSISTENTNA BAZA ─────────────────
+# Keširanje u session_state — svaki Sheet se čita JEDNOM po sesiji,
+# ne pri svakom re-renderu stranice (sprečava 429 quota greške).
+
+_CACHE_KEYS = {
+    "amm":   "_cache_amm",
+    "alert": "_cache_alert",
+    "sales": "_cache_sales",
+    "scan":  "_cache_scan",
+}
+
+def _cache_get(key: str):
+    return st.session_state.get(_CACHE_KEYS[key])
+
+def _cache_set(key: str, value):
+    st.session_state[_CACHE_KEYS[key]] = value
+
+# ── SCAN ──────────────────────────────────────────────────────────────────────
 
 def save_scan_gsheet(df: pd.DataFrame):
     try:
         ws = get_sheet("scan_baza")
         ws.clear()
-        if df.empty:
-            return
-        data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-        ws.update(data)
+        if not df.empty:
+            data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+            ws.update(data)
     except Exception as e:
         st.warning(f"GSheet scan save greška: {e}")
-    # lokalni fallback
     df.to_json(SCAN_FILE, orient="records", force_ascii=False)
+    _cache_set("scan", df)
 
 def load_scan_gsheet() -> pd.DataFrame:
+    cached = _cache_get("scan")
+    if cached is not None:
+        return cached
     try:
         ws = get_sheet("scan_baza")
         data = ws.get_all_records()
         if data:
-            return pd.DataFrame(data)
+            df = pd.DataFrame(data)
+            _cache_set("scan", df)
+            return df
     except Exception as e:
         st.warning(f"GSheet scan load greška: {e}")
     if SCAN_FILE.exists():
         try:
-            return pd.read_json(SCAN_FILE, orient="records")
+            df = pd.read_json(SCAN_FILE, orient="records")
+            _cache_set("scan", df)
+            return df
         except Exception:
             pass
     return pd.DataFrame()
 
 def scan_meta_gsheet() -> str | None:
-    try:
-        ws = get_sheet("scan_baza")
-        val = ws.acell("A1").value
-        if val:
-            return "dostupan"
-    except Exception:
-        pass
+    cached = _cache_get("scan")
+    if cached is not None and not cached.empty:
+        return "dostupan (keš)"
     if SCAN_FILE.exists():
         mtime = SCAN_FILE.stat().st_mtime
         return datetime.datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
     return None
+
+# ── AMM ───────────────────────────────────────────────────────────────────────
 
 def save_amm_gsheet(df: pd.DataFrame):
     try:
@@ -218,14 +240,18 @@ def save_amm_gsheet(df: pd.DataFrame):
         ws.clear()
         if df.empty:
             ws.update([AMM_COLS])
-            return
-        data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-        ws.update(data)
+        else:
+            data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+            ws.update(data)
     except Exception as e:
         st.warning(f"GSheet AMM save greška: {e}")
     df.to_csv(AMM_FILE, index=False)
+    _cache_set("amm", df)
 
 def load_amm_gsheet() -> pd.DataFrame:
+    cached = _cache_get("amm")
+    if cached is not None:
+        return cached
     try:
         ws = get_sheet("amm_baza")
         data = ws.get_all_records()
@@ -235,6 +261,7 @@ def load_amm_gsheet() -> pd.DataFrame:
                 if c not in df.columns:
                     df[c] = ""
             df.to_csv(AMM_FILE, index=False)
+            _cache_set("amm", df)
             return df
     except Exception as e:
         st.warning(f"GSheet AMM load greška: {e}")
@@ -243,8 +270,13 @@ def load_amm_gsheet() -> pd.DataFrame:
         for c in AMM_COLS:
             if c not in df.columns:
                 df[c] = ""
+        _cache_set("amm", df)
         return df
-    return pd.DataFrame(columns=AMM_COLS)
+    empty = pd.DataFrame(columns=AMM_COLS)
+    _cache_set("amm", empty)
+    return empty
+
+# ── ALERT LOG ─────────────────────────────────────────────────────────────────
 
 def save_alert_log_gsheet(df: pd.DataFrame):
     try:
@@ -252,14 +284,18 @@ def save_alert_log_gsheet(df: pd.DataFrame):
         ws.clear()
         if df.empty:
             ws.update([ALERT_COLS])
-            return
-        data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-        ws.update(data)
+        else:
+            data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+            ws.update(data)
     except Exception as e:
         st.warning(f"GSheet alert log save greška: {e}")
     df.to_csv(ALERT_FILE, index=False)
+    _cache_set("alert", df)
 
 def load_alert_log_gsheet() -> pd.DataFrame:
+    cached = _cache_get("alert")
+    if cached is not None:
+        return cached
     try:
         ws = get_sheet("alert_log")
         data = ws.get_all_records()
@@ -269,6 +305,7 @@ def load_alert_log_gsheet() -> pd.DataFrame:
                 if c not in df.columns:
                     df[c] = ""
             df.to_csv(ALERT_FILE, index=False)
+            _cache_set("alert", df)
             return df
     except Exception as e:
         st.warning(f"GSheet alert log load greška: {e}")
@@ -277,8 +314,11 @@ def load_alert_log_gsheet() -> pd.DataFrame:
         for c in ALERT_COLS:
             if c not in df.columns:
                 df[c] = ""
+        _cache_set("alert", df)
         return df
-    return pd.DataFrame(columns=ALERT_COLS)
+    empty = pd.DataFrame(columns=ALERT_COLS)
+    _cache_set("alert", empty)
+    return empty
 
 def append_alert_log_gsheet(rows: list):
     try:
@@ -290,12 +330,17 @@ def append_alert_log_gsheet(rows: list):
         ws.append_rows(new_rows)
     except Exception as e:
         st.warning(f"GSheet alert append greška: {e}")
-        # fallback lokalno
-        existing_df = load_alert_log_gsheet()
-        merged = pd.concat([existing_df, pd.DataFrame(rows)], ignore_index=True)
-        merged.to_csv(ALERT_FILE, index=False)
+    existing_df = _cache_get("alert") or pd.DataFrame(columns=ALERT_COLS)
+    merged = pd.concat([existing_df, pd.DataFrame(rows)], ignore_index=True)
+    merged.to_csv(ALERT_FILE, index=False)
+    _cache_set("alert", merged)
+
+# ── SALES ─────────────────────────────────────────────────────────────────────
 
 def load_sales_gsheet() -> dict:
+    cached = _cache_get("sales")
+    if cached is not None:
+        return cached
     try:
         ws = get_sheet("sales_baza")
         data = ws.get_all_records()
@@ -306,15 +351,20 @@ def load_sales_gsheet() -> dict:
                 emails_str = row.get("emails", "")
                 if city:
                     result[city] = [e.strip() for e in emails_str.split(",") if e.strip()]
+            _cache_set("sales", result)
             return result
     except Exception as e:
         st.warning(f"GSheet sales load greška: {e}")
     if SALES_FILE.exists():
         try:
-            return json.loads(SALES_FILE.read_text(encoding="utf-8"))
+            data = json.loads(SALES_FILE.read_text(encoding="utf-8"))
+            _cache_set("sales", data)
+            return data
         except Exception:
             pass
-    return {city: [] for city in CITIES}
+    default = {city: [] for city in CITIES}
+    _cache_set("sales", default)
+    return default
 
 def save_sales_gsheet(data: dict):
     try:
@@ -327,6 +377,7 @@ def save_sales_gsheet(data: dict):
     except Exception as e:
         st.warning(f"GSheet sales save greška: {e}")
     SALES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _cache_set("sales", data)
 
 # ── Aliasi ────────────────────────────────────────────────────────────────────
 def load_amm() -> pd.DataFrame:        return load_amm_gsheet()
