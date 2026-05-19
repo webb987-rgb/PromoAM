@@ -339,7 +339,12 @@ def append_alert_log_gsheet(rows: list):
         ws.append_rows(new_rows)
     except Exception as e:
         st.warning(f"GSheet alert append greška: {e}")
-    existing_df = _cache_get("alert") or pd.DataFrame(columns=ALERT_COLS)
+        
+    # ISPRAVKA:
+    existing_df = _cache_get("alert")
+    if existing_df is None:
+        existing_df = pd.DataFrame(columns=ALERT_COLS)
+        
     merged = pd.concat([existing_df, pd.DataFrame(rows)], ignore_index=True)
     merged.to_csv(ALERT_FILE, index=False)
     _cache_set("alert", merged)
