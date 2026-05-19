@@ -52,30 +52,39 @@ ALERT_FILE = Path("alert_log.csv")
 # ── Višestruke lokacije po gradu ─────────────────────────────────────────────
 CITY_MULTI_COORDS = {
     "Beograd": [
-        (44.8610, 20.3450), (44.8395, 20.3662), (44.8492, 20.3831),
-        (44.8361, 20.3828), (44.8430, 20.3955), (44.8225, 20.3995),
-        (44.8251, 20.4102), (44.8152, 20.3798), (44.8188, 20.4075),
-        (44.8130, 20.4182), (44.8255, 20.4571), (44.8180, 20.4522),
-        (44.8160, 20.4735), (44.8115, 20.4651), (44.8142, 20.4870),
-        (44.8001, 20.4705), (44.8042, 20.4521), (44.7932, 20.4800),
-        (44.8145, 20.4990), (44.8175, 20.5182), (44.8160, 20.4950),
-        (44.8080, 20.4905), (44.8045, 20.4820), (44.8048, 20.4825),
-        (44.7960, 20.4960), (44.7925, 20.4430), (44.7870, 20.4660),
-        (44.7865, 20.4860), (44.7920, 20.4350), (44.7820, 20.4550),
-        (44.7760, 20.4180), (44.7700, 20.4800), (44.7850, 20.5350),
-        (44.7500, 20.4100), (44.7850, 20.5400), (44.7620, 20.4850),
-        (44.7580, 20.4900), (44.7580, 20.4850), (44.7720, 20.4350),
-        (44.7600, 20.4750), (44.7975, 20.4650), (44.7380, 20.4450),
-        (44.7400, 20.4700), (44.7900, 20.5300), (44.8100, 20.5100),
-        (44.7880, 20.5300), (44.7950, 20.3500), (44.8050, 20.3880),
-        (44.8070, 20.4100), (44.8130, 20.4350), (44.8520, 20.3400),
-        (44.7500, 20.4100), (44.7500, 20.4150), (44.7500, 20.4900),
-        (44.7600, 20.4850), (44.7600, 20.4900), (44.7550, 20.4150),
-        (44.7620, 20.4200), (44.8450, 20.3700), (44.8400, 20.4100),
-        (44.8150, 20.4250), (44.8100, 20.4350), (44.7550, 20.4100),
-        (44.8350, 20.3800), (44.8180, 20.4620), (44.8080, 20.4630),
-        (44.8150, 20.5250), (44.7850, 20.5400), (44.7700, 20.4100),
-        (44.8030, 20.4680),
+        # Zapad / Zemun / Novi Beograd
+        (44.8610, 20.3450),  # Autoput za Novi Sad — Zemun sever
+        (44.8395, 20.3662),  # Dobanovački put — Zemun jug
+        (44.8251, 20.4102),  # Omladinskih brigada — Novi Beograd centar
+        (44.8130, 20.4182),  # Bulevar Zorana Đinđića — Novi Beograd istok
+        (44.8050, 20.3880),  # Nehruova — Novi Beograd zapad
+        # Centar / Stari grad
+        (44.8255, 20.4571),  # Skenderbegova — Savamala
+        (44.8180, 20.4522),  # Kralja Petra — Stari grad
+        (44.8160, 20.4735),  # Bulevar despota Stefana
+        (44.8042, 20.4521),  # Savska — centar
+        (44.8180, 20.4620),  # Francuska
+        # Vračar / Zvezdara
+        (44.8001, 20.4705),  # Katanićeva — Vračar
+        (44.8145, 20.4990),  # Dragoslava Srejovića — Zvezdara
+        (44.8080, 20.4905),  # Veljka Dugoševića
+        (44.7932, 20.4800),  # Južni bulevar
+        (44.8175, 20.5182),  # Višnjička
+        # Palilula / Karaburma
+        (44.8160, 20.4950),  # Višnjička 17b
+        (44.8100, 20.5100),  # Mirijevska
+        # Voždovac / Dedinje
+        (44.7925, 20.4430),  # Bulevar vojvode Putnika
+        (44.7920, 20.4350),  # Bulevar vojvode Mišića
+        (44.7820, 20.4550),  # Šekspirova — Dedinje
+        # Čukarica / Rakovica
+        (44.7760, 20.4180),  # Požeška
+        (44.7500, 20.4100),  # Slavonskih brigada — Čukarica
+        # Banjica / Autokomanda
+        (44.7870, 20.4660),  # Ustanička
+        (44.7975, 20.4650),  # Avalska
+        # Bežanijska kosa / Blok 45
+        (44.8070, 20.4100),  # Jurija Gagarina
     ],
     "Novi Sad": [
         (45.2671, 19.8335), (45.2500, 19.8100), (45.2850, 19.8600),
@@ -1161,11 +1170,6 @@ with tab_scan:
         st.warning("⏹️ Zaustavljanje...")
 
     if run_nopromo and selected_cities and not st.session_state.scan_running and nopromo_available:
-        cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
-        if cookie:
-            session.headers["Cookie"] = cookie
-        elif "Cookie" in session.headers:
-            del session.headers["Cookie"]
         st.session_state.scan_stop_event = threading.Event()
         st.session_state.scan_running = True
         st.session_state.scan_mode = "nopromo"
@@ -1175,7 +1179,6 @@ with tab_scan:
         _prev_df_snap = st.session_state.df_wolt.copy()
         Path("_scan_done.txt").unlink(missing_ok=True)
         Path("_scan_result.json").unlink(missing_ok=True)
-        Path("_scan_cookie.txt").write_text(st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or "")
         with _city_progress_lock:
             _city_progress.clear()
             for _c in _cities_snap:
@@ -1193,11 +1196,6 @@ with tab_scan:
         st.rerun()
 
     if run_scan and selected_cities and not st.session_state.scan_running:
-        cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
-        if cookie:
-            session.headers["Cookie"] = cookie
-        elif "Cookie" in session.headers:
-            del session.headers["Cookie"]
         st.session_state.scan_stop_event = threading.Event()
         st.session_state.scan_running = True
         st.session_state.scan_mode = "full"
@@ -1206,7 +1204,6 @@ with tab_scan:
         _stop_ev_snap = st.session_state.scan_stop_event
         Path("_scan_done.txt").unlink(missing_ok=True)
         Path("_scan_result.json").unlink(missing_ok=True)
-        Path("_scan_cookie.txt").write_text(st.session_state.get("wolt_cookie", "") or WOLT_COOKIE or "")
         with _city_progress_lock:
             _city_progress.clear()
             for _c in _cities_snap:
@@ -1314,18 +1311,17 @@ with tab_scan:
             st.markdown(f"<div style='background:#e8f8f0;border-left:4px solid #27ae60;padding:8px 16px;border-radius:6px;margin-bottom:12px;font-size:0.95rem;color:#155724'>⏱️ Poslednji sken trajao: <strong>{m_t:02d}:{s_t:02d}</strong></div>", unsafe_allow_html=True)
         st.markdown("---")
 
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1, k2, k3, k4, k5 = st.columns(5)
         total        = len(df)
         sa_akcijama  = len(df[df["akcije"] != "-"])
         otvoreni     = len(df[df["status"] == "Otvoren"])
         novi         = len(df[df["novo"] == "Da"])
         sa_wolt_plus = len(df[df["akcije"].apply(lambda c: bool(re.search(r'\[Wolt\+\]|Wolt\+|W\+', c, re.IGNORECASE)) if pd.notna(c) else False)])
-        sa_snizenjem = len(df[df["akcije"].str.contains("[Sniženje", na=False, regex=False)])
 
         for col, val, lbl in [
             (k1, total, "Ukupno restorana"), (k2, sa_akcijama, "Ima akciju"),
-            (k3, sa_snizenjem, "🏷️ Sniženi artikli"), (k4, sa_wolt_plus, "Wolt+ akcije"),
-            (k5, otvoreni, "Trenutno otvoreno"), (k6, novi, "Novi restorani"),
+            (k3, sa_wolt_plus, "💙 Wolt+ akcije"),
+            (k4, otvoreni, "Trenutno otvoreno"), (k5, novi, "Novi restorani"),
         ]:
             with col:
                 st.markdown(f"<div class='kpi'><div class='kpi-val'>{val}</div><div class='kpi-lbl'>{lbl}</div></div>", unsafe_allow_html=True)
@@ -1350,26 +1346,25 @@ with tab_scan:
                 </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        fc1, fc2, fc3, fc4 = st.columns(4)
-        with fc1: grad_filter = st.multiselect("Grad:", CITIES, default=CITIES, key="scan_grad")
-        with fc2: samo_akcije = st.checkbox("📌 Samo sa akcijama", value=False, key="scan_akcije")
-        with fc3: samo_novi = st.checkbox("🆕 Samo NOVI", value=False, key="scan_novi")
-        with fc4: search = st.text_input("🔎 Pretraži naziv:", key="scan_search")
 
-        fc5, fc6, fc7 = st.columns(3)
-        with fc5: samo_wolt_plus = st.checkbox("💙 Samo sa Wolt+ akcijama", value=False, key="scan_wolt_plus")
-        with fc6: samo_otvoreni = st.checkbox("🟢 Samo otvoreni", value=False, key="scan_otvoreni")
-        with fc7: samo_snizeni = st.checkbox("🏷️ Samo sa sniženim artiklima", value=False, key="scan_snizeni")
+        # ── Filteri — kompaktno u dva reda ───────────────────────────────────
+        ff1, ff2, ff3, ff4, ff5, ff6 = st.columns([2, 1, 1, 1, 1, 2])
+        with ff1: grad_filter = st.multiselect("📍 Grad:", CITIES, default=CITIES, key="scan_grad")
+        with ff2: samo_akcije = st.checkbox("📌 Sa akcijama", value=False, key="scan_akcije")
+        with ff3: samo_wolt_plus = st.checkbox("💙 Wolt+", value=False, key="scan_wolt_plus")
+        with ff4: samo_pct_popust = st.checkbox("🔢 % popust", value=False, key="scan_pct_popust")
+        with ff5: samo_otvoreni = st.checkbox("🟢 Otvoreni", value=False, key="scan_otvoreni")
+        with ff6: search = st.text_input("🔎 Pretraži naziv:", key="scan_search", placeholder="naziv restorana...")
 
-        fc8, _, _ = st.columns(3)
-        with fc8: samo_pct_popust = st.checkbox("🔢 Samo sa % popustom", value=False, key="scan_pct_popust")
-
-        sve_akcije_tekst = sorted(set(
-            line.lstrip("• ").strip()
-            for akcije_cell in df["akcije"] if akcije_cell != "-"
-            for line in akcije_cell.split("\n") if line.strip() and line.strip() != "-"
-        ))
-        akcija_filter = st.multiselect("🎯 Filtriraj po akciji:", options=sve_akcije_tekst, default=[], key="scan_akcija_filter")
+        ff7, ff8 = st.columns([1, 3])
+        with ff7: samo_novi = st.checkbox("🆕 Samo novi restorani", value=False, key="scan_novi")
+        with ff8:
+            sve_akcije_tekst = sorted(set(
+                line.lstrip("• ").strip()
+                for akcije_cell in df["akcije"] if akcije_cell != "-"
+                for line in akcije_cell.split("\n") if line.strip() and line.strip() != "-"
+            ))
+            akcija_filter = st.multiselect("🎯 Filtriraj po tipu akcije:", options=sve_akcije_tekst, default=[], key="scan_akcija_filter", placeholder="Sve akcije...")
 
         fdf = df[df["grad"].isin(grad_filter)]
         if samo_akcije: fdf = fdf[fdf["akcije"] != "-"]
@@ -1382,8 +1377,6 @@ with tab_scan:
             fdf = fdf[fdf["akcije"].apply(lambda cell: bool(re.search(r'\[Wolt\+\]|Wolt\+|W\+', cell, re.IGNORECASE)) if cell != "-" else False)]
         if samo_pct_popust:
             fdf = fdf[fdf["akcije"].str.contains(r'\d+\s*%', na=False, regex=True)]
-        if samo_snizeni:
-            fdf = fdf[fdf["akcije"].str.contains("[Sniženje", na=False, regex=False)]
 
         display_cols = ["grad", "naziv", "status", "ocena", "dostava", "novo", "akcije", "link"]
         display_cols = [c for c in display_cols if c in fdf.columns]
@@ -1709,6 +1702,11 @@ with tab_sched:
 with tab_debug:
     st.markdown("### 🔧 Debug & Podešavanja")
 
+    _debug_pass = st.text_input("🔑 Lozinka za pristup:", type="password", key="debug_pass_input")
+    if _debug_pass != "zekapeka":
+        st.warning("Unesite lozinku za pristup Debug tabu.")
+        st.stop()
+
     st.markdown("#### 📊 Google Sheets Status")
     try:
         client = get_gsheet_client()
@@ -1718,19 +1716,6 @@ with tab_debug:
         st.info(f"Tabovi u Sheetu: {', '.join(tabs)}")
     except Exception as e:
         st.error(f"❌ Google Sheets greška: {e}")
-
-    st.markdown("---")
-    st.markdown("#### 🍪 Cookie")
-    saved_cookie = st.session_state.get("wolt_cookie", WOLT_COOKIE)
-    new_cookie = st.text_area("Cookie string:", value=saved_cookie, height=100,
-                              placeholder="ravelinDeviceId=...; __woltUid=...; ...", key="cookie_input")
-    if st.button("💾 Sačuvaj cookie", key="save_cookie"):
-        st.session_state["wolt_cookie"] = new_cookie
-        session.headers["Cookie"] = new_cookie
-        st.success("✅ Cookie primenjen.")
-
-    if "wolt_cookie" in st.session_state and st.session_state["wolt_cookie"]:
-        session.headers["Cookie"] = st.session_state["wolt_cookie"]
 
     st.markdown("---")
     st.markdown("#### 📍 Lokacije po gradu")
