@@ -797,7 +797,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
         return []
 
     restaurants = {}
-    _update_city_progress(city_display, found=0, total=0, status="Učitavam listu restorana...")
+    _update_city_progress(city_display, found=0, total=0, status="Loading restaurant list...")
     _write_status_file()
 
     for loc_idx, (lat, lon) in enumerate(multi_coords):
@@ -858,18 +858,18 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                         }
             new_this_page = len(restaurants) - count_before
             _update_city_progress(city_display, found=len(restaurants),
-                                  status=f"📍 {loc_label} | str.{page_num+1} +{new_this_page} (ukupno {len(restaurants)})")
+                                  status=f"📍 {loc_label} | str.{page_num+1} +{new_this_page} (total {len(restaurants)})")
             _write_status_file()
             if items_in_response == 0:
                 break
             skip += 40
             time.sleep(random.uniform(0.5, 1.8))
-        _update_city_progress(city_display, status=f"✅ Lokacija {loc_idx+1}/{len(multi_coords)} gotova ({len(restaurants)} ukupno)")
+        _update_city_progress(city_display, status=f"✅ Location {loc_idx+1}/{len(multi_coords)} done ({len(restaurants)} total)")
         _write_status_file()
 
     if not restaurants or stop_event.is_set():
         if not restaurants:
-            _update_city_progress(city_display, status="⚠️ Nije pronađen nijedan restoran.")
+            _update_city_progress(city_display, status="⚠️ No restaurants found.")
         _write_status_file()
         return []
 
@@ -877,7 +877,7 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
     total = len(slugs)
     completed = 0
     _update_city_progress(city_display, total=total, found=total,
-                          status=f"⚡ Učitavam akcije (0/{total})...")
+                          status=f"⚡ Loading promotions (0/{total})...")
     _write_status_file()
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
@@ -898,13 +898,13 @@ def fetch_city(city_display: str, status_placeholder, stop_event: threading.Even
                 pass
             completed += 1
             if completed % 10 == 0 or completed == total:
-                _update_city_progress(city_display, status=f"⚡ Akcije: {completed}/{total} restorana")
+                _update_city_progress(city_display, status=f"⚡ Promotions: {completed}/{total} restaurants")
                 _write_status_file()
 
     for r in restaurants.values():
         r.pop("_feed_akcije", None)
 
-    _update_city_progress(city_display, status=f"✅ Završen! {len(restaurants)} restorana")
+    _update_city_progress(city_display, status=f"✅ Done! {len(restaurants)} restaurants")
     _write_status_file()
     return list(restaurants.values())
 
@@ -912,7 +912,7 @@ def scan_all_cities(selected_cities: list[str], status_placeholder, stop_event: 
     with _city_progress_lock:
         _city_progress.clear()
     for city in selected_cities:
-        _update_city_progress(city, found=0, total=0, status="⏳ Čeka na red...")
+        _update_city_progress(city, found=0, total=0, status="⏳ Waiting in queue...")
     _write_status_file()
     all_rows = []
     for i, city in enumerate(selected_cities):
@@ -922,7 +922,7 @@ def scan_all_cities(selected_cities: list[str], status_placeholder, stop_event: 
             rows = fetch_city(city, status_placeholder, stop_event)
             all_rows.extend(rows)
         except Exception as e:
-            _update_city_progress(city, status=f"❌ Greška: {e}")
+            _update_city_progress(city, status=f"❌ Error: {e}")
             _write_status_file()
         if i < len(selected_cities) - 1 and not stop_event.is_set():
             time.sleep(0.5)
@@ -943,7 +943,7 @@ def scan_nopromo_cities(selected_cities: list[str], prev_df: pd.DataFrame, stop_
     for city in selected_cities:
         city_count = len(no_promo[no_promo["grad"] == city])
         _update_city_progress(city, found=city_count, total=city_count,
-                              status=f"⏳ Čeka na red... ({city_count} restorana za sken)")
+                              status=f"⏳ Waiting in queue... ({city_count} restorana za sken)")
     _write_status_file()
 
     updated_rows = []
@@ -956,7 +956,7 @@ def scan_nopromo_cities(selected_cities: list[str], prev_df: pd.DataFrame, stop_
         slugs = city_subset["slug"].tolist() if "slug" in city_subset.columns else []
         total = len(slugs)
         completed = 0
-        _update_city_progress(city, found=total, total=total, status=f"⚡ Skeniranje akcija (0/{total})...")
+        _update_city_progress(city, found=total, total=total, status=f"⚡ Scanning promotions (0/{total})...")
         _write_status_file()
         slug_to_row = {row["slug"]: row.to_dict() for _, row in city_subset.iterrows()} if "slug" in city_subset.columns else {}
 
@@ -980,7 +980,7 @@ def scan_nopromo_cities(selected_cities: list[str], prev_df: pd.DataFrame, stop_
                 if completed % 10 == 0 or completed == total:
                     _update_city_progress(city, status=f"⚡ Akcije: {completed}/{total}")
                     _write_status_file()
-        _update_city_progress(city, status=f"✅ Završen! {total} restorana skeniran")
+        _update_city_progress(city, status=f"✅ Done! {total} restaurants scanned")
         _write_status_file()
 
     all_parts = []
@@ -1163,7 +1163,7 @@ def run_scheduled_scan_and_send():
     try:
         df = scan_all_cities(cfg["cities"], NullPH(), stop_ev)
     except Exception as e:
-        log.error(f"[Scheduler] Greška pri skenu: {e}")
+        log.error(f"[Scheduler] Scan error: {e}")
         release_scan_lock()
         return
 
@@ -1257,18 +1257,68 @@ def run_scheduled_scan_and_send():
 
     release_scan_lock()
 
+DAYS_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
 def _scheduler_loop():
     while True:
         cfg = load_scheduler_config()
+        now = datetime.datetime.now()
+        slept = False
+
+        # ── Global full scan ─────────────────────────────────────────────────
         if cfg.get("enabled"):
-            now = datetime.datetime.now()
             target = now.replace(hour=cfg["hour"], minute=cfg["minute"], second=0, microsecond=0)
             if now >= target:
                 target += datetime.timedelta(days=1)
             wait_sec = (target - now).total_seconds()
             time.sleep(wait_sec)
             run_scheduled_scan_and_send()
-        else:
+            slept = True
+
+        # ── Per-city schedules ────────────────────────────────────────────────
+        city_schedules = cfg.get("city_schedules", {})
+        for city, cs in city_schedules.items():
+            if not cs.get("enabled") or not cs.get("days"):
+                continue
+            now2 = datetime.datetime.now()
+            cur_day_short = DAYS_SHORT[now2.weekday()]
+            if cur_day_short not in cs["days"]:
+                continue
+            target_c = now2.replace(hour=cs["hour"], minute=cs["minute"], second=0, microsecond=0)
+            # Only fire if we're within 60 seconds past the target time
+            diff = (now2 - target_c).total_seconds()
+            if 0 <= diff < 60:
+                # Run city rescan
+                import logging
+                log = logging.getLogger("scheduler")
+                if not acquire_scan_lock():
+                    log.warning(f"[Scheduler-City] {city}: scan already running, skipping.")
+                    continue
+                stop_ev = threading.Event()
+                class NullPH:
+                    def info(self, *a, **kw): pass
+                    def warning(self, *a, **kw): pass
+                    def success(self, *a, **kw): pass
+                    def error(self, *a, **kw): pass
+                    def empty(self, *a, **kw): pass
+                try:
+                    prev_df = load_scan()
+                    new_city_df = scan_all_cities([city], NullPH(), stop_ev)
+                    if new_city_df is not None and not new_city_df.empty:
+                        if not prev_df.empty:
+                            other = prev_df[prev_df["grad"] != city]
+                            merged = pd.concat([other, new_city_df], ignore_index=True)
+                        else:
+                            merged = new_city_df
+                        save_scan(merged)
+                        log.info(f"[Scheduler-City] {city}: city rescan done, {len(new_city_df)} restaurants.")
+                except Exception as e:
+                    log.error(f"[Scheduler-City] {city}: error — {e}")
+                finally:
+                    release_scan_lock()
+                slept = True
+
+        if not slept:
             time.sleep(60)
 
 if "scheduler_started" not in st.session_state:
@@ -1296,15 +1346,15 @@ if "scan_duration_last" not in st.session_state:
 # ─────────────────────────── UI ──────────────────────────────────────────────
 
 st.title("🏷️ Promo Monitor – Item Level")
-st.caption("Skenira item-level popuste: ulazi u svaki restoran i proverava da li ima makar jedan snižen proizvod.")
+st.caption("Scans item-level discounts: checks each restaurant for at least one discounted product.")
 
 tab_scan, tab_amm, tab_alert, tab_stats, tab_sched, tab_debug, tab_reset = st.tabs([
-    "🔍 Scan & Rezultati",
-    "👥 AMM Baza",
-    "📧 Pošalji Alert",
-    "📈 Statistika",
-    "⏰ Auto-Scheduler",
-    "🔧 Debug API",
+    "🔍 Scan & Results",
+    "👥 AM Database",
+    "📧 Send Alert",
+    "📈 Statistics",
+    "⏰ Scheduler",
+    "⚙️ Settings",
     "🗑️ Reset & Backup",
 ])
 
@@ -1313,7 +1363,7 @@ tab_scan, tab_amm, tab_alert, tab_stats, tab_sched, tab_debug, tab_reset = st.ta
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_scan:
     st.markdown("### 🔍 Scan")
-    selected_cities = st.multiselect("📍 Gradovi za skeniranje:", options=CITIES, default=CITIES, key="selected_cities")
+    selected_cities = st.multiselect("📍 Cities to scan:", options=CITIES, default=CITIES, key="selected_cities")
 
     prev_df_for_nopromo = st.session_state.df_wolt
     nopromo_available = not prev_df_for_nopromo.empty
@@ -1325,43 +1375,92 @@ with tab_scan:
     else:
         no_promo_count = 0
 
-    col_btn, col_btn2, col_stop, col_info = st.columns([1.2, 1.5, 0.9, 2.4])
+    col_btn, col_btn2, col_btn3, col_stop, col_info = st.columns([1.2, 1.5, 1.5, 0.9, 2.4])
     with col_btn:
         run_scan = st.button("▶️ Full Scan", type="primary", use_container_width=True,
                              disabled=not selected_cities or st.session_state.scan_running)
     with col_btn2:
         run_nopromo = st.button(f"🔍 No Promo Scan ({no_promo_count})", use_container_width=True,
                                 disabled=not selected_cities or st.session_state.scan_running or not nopromo_available or no_promo_count == 0)
+    with col_btn3:
+        run_city_rescan = st.button("🔄 City Rescan", use_container_width=True,
+                                    disabled=not selected_cities or st.session_state.scan_running or not nopromo_available,
+                                    help="Re-scans selected cities from scratch and merges results with the existing scan (other cities are preserved).")
     with col_stop:
-        stop_scan = st.button("⏹️ Zaustavi", use_container_width=True,
+        stop_scan = st.button("⏹️ Stop", use_container_width=True,
                               disabled=not st.session_state.scan_running, type="secondary")
     with col_info:
         if st.session_state.last_scan:
-            st.info(f"⏱️ Poslednji scan: **{st.session_state.last_scan}** | Ukupno restorana: **{len(st.session_state.df_wolt)}**")
+            st.info(f"⏱️ Last scan: **{st.session_state.last_scan}** | Total restaurants: **{len(st.session_state.df_wolt)}**")
         if not selected_cities:
-            st.warning("Izaberi bar jedan grad.")
+            st.warning("Select at least one city.")
 
     prev_meta = scan_meta()
     if prev_meta and not st.session_state.scan_running:
         load_col, _ = st.columns([2, 4])
         with load_col:
-            if st.button(f"📂 Učitaj prethodni sken ({prev_meta})", use_container_width=True):
+            if st.button(f"📂 Load previous scan ({prev_meta})", use_container_width=True):
                 prev_df = load_scan()
                 if not prev_df.empty:
                     st.session_state.df_wolt = prev_df
                     st.session_state.last_scan = prev_meta
-                    st.success(f"✅ Učitan prethodni sken – {len(prev_df)} restorana.")
+                    st.success(f"✅ Previous scan loaded – {len(prev_df)} restaurants.")
                     st.rerun()
                 else:
-                    st.error("Greška pri učitavanju fajla.")
+                    st.error("Error loading file.")
 
     if stop_scan and st.session_state.scan_running:
         st.session_state.scan_stop_event.set()
-        st.warning("⏹️ Zaustavljanje...")
+        st.warning("⏹️ Stopping...")
+
+    # ── CITY RESCAN: full scan only selected cities, merge with existing ───────
+    if run_city_rescan and selected_cities and not st.session_state.scan_running and nopromo_available:
+        if not acquire_scan_lock():
+            st.error("⛔ A scan is already running. Try again later.")
+        else:
+            st.session_state.scan_stop_event = threading.Event()
+            st.session_state.scan_running = True
+            st.session_state.scan_mode = "city_rescan"
+            st.session_state.scan_start_time = time.time()
+            _cities_snap = list(selected_cities)
+            _stop_ev_snap = st.session_state.scan_stop_event
+            _prev_df_snap = st.session_state.df_wolt.copy()
+            Path("_scan_done.txt").unlink(missing_ok=True)
+            Path("_scan_result.json").unlink(missing_ok=True)
+            with _city_progress_lock:
+                _city_progress.clear()
+                for _c in _cities_snap:
+                    _city_progress[_c] = {"found": 0, "total": 0, "status": "⏳ Waiting..."}
+            _write_status_file()
+
+            def _run_city_rescan_bg():
+                try:
+                    class LivePH:
+                        def info(self, msg, *a, **k): Path("_scan_status.txt").write_text(str(msg))
+                        def warning(self, msg, *a, **k): Path("_scan_status.txt").write_text("⚠️ " + str(msg))
+                        def success(self, msg, *a, **k): Path("_scan_status.txt").write_text("✅ " + str(msg))
+                        def error(self, msg, *a, **k): Path("_scan_status.txt").write_text("❌ " + str(msg))
+                        def empty(self, *a, **k): pass
+                    # Full scan only for selected cities
+                    new_city_df = scan_all_cities(_cities_snap, LivePH(), _stop_ev_snap)
+                    if new_city_df is not None and not new_city_df.empty:
+                        # Keep rows from OTHER cities in the existing scan, replace selected cities
+                        other_cities_df = _prev_df_snap[~_prev_df_snap["grad"].isin(_cities_snap)].copy()
+                        merged_df = pd.concat([other_cities_df, new_city_df], ignore_index=True)
+                        merged_df.to_json("_scan_result.json", orient="records", force_ascii=False)
+                    elif not _stop_ev_snap.is_set():
+                        # Nothing found but not stopped — keep old data
+                        _prev_df_snap.to_json("_scan_result.json", orient="records", force_ascii=False)
+                finally:
+                    release_scan_lock()
+                    Path("_scan_done.txt").write_text("1")
+
+            threading.Thread(target=_run_city_rescan_bg, daemon=True).start()
+            st.rerun()
 
     if run_nopromo and selected_cities and not st.session_state.scan_running and nopromo_available:
         if not acquire_scan_lock():
-            st.error("⛔ Scan je već aktivan (drugi korisnik ili zakazani sken). Pokušaj malo kasnije.")
+            st.error("⛔ A scan is already running (another user or scheduled scan). Try again later.")
         else:
             st.session_state.scan_stop_event = threading.Event()
             st.session_state.scan_running = True
@@ -1376,7 +1475,7 @@ with tab_scan:
                 _city_progress.clear()
                 for _c in _cities_snap:
                     _cnt = len(_prev_df_snap[(_prev_df_snap["grad"] == _c) & (_prev_df_snap["akcije"] == "-")])
-                    _city_progress[_c] = {"found": _cnt, "total": _cnt, "status": f"⏳ Čeka na red... ({_cnt} res.)"}
+                    _city_progress[_c] = {"found": _cnt, "total": _cnt, "status": f"⏳ Waiting... ({_cnt} rest.)"}
             _write_status_file()
 
             def _run_nopromo_bg():
@@ -1393,7 +1492,7 @@ with tab_scan:
 
     if run_scan and selected_cities and not st.session_state.scan_running:
         if not acquire_scan_lock():
-            st.error("⛔ Scan je već aktivan (drugi korisnik ili zakazani sken). Pokušaj malo kasnije.")
+            st.error("⛔ A scan is already running (another user or scheduled scan). Try again later.")
         else:
             st.session_state.scan_stop_event = threading.Event()
             st.session_state.scan_running = True
@@ -1406,7 +1505,7 @@ with tab_scan:
             with _city_progress_lock:
                 _city_progress.clear()
                 for _c in _cities_snap:
-                    _city_progress[_c] = {"found": 0, "total": 0, "status": "⏳ Čeka na red..."}
+                    _city_progress[_c] = {"found": 0, "total": 0, "status": "⏳ Waiting..."}
             _write_status_file()
 
             def _run_scan_bg():
@@ -1432,7 +1531,7 @@ with tab_scan:
     if st.session_state.scan_running and not scan_done_flag:
         elapsed = time.time() - (st.session_state.scan_start_time or time.time())
         m2, s2 = divmod(int(elapsed), 60)
-        st.markdown(f"### 🔄 Skeniranje u toku — {m2:02d}:{s2:02d}")
+        st.markdown(f"### 🔄 Scan in progress — {m2:02d}:{s2:02d}")
         city_prog = {}
         for _ in range(3):
             try:
@@ -1461,7 +1560,7 @@ with tab_scan:
                                 border-top:4px solid {color};margin-bottom:8px'>
                       <div style='font-weight:800;font-size:1.1rem;color:{color}'>{city_name}</div>
                       <div style='font-size:1.8rem;font-weight:900;color:#222'>{found}</div>
-                      <div style='font-size:0.75rem;color:#888'>restorana pronađeno</div>
+                      <div style='font-size:0.75rem;color:#888'>restaurants found</div>
                       <div style='font-size:0.8rem;color:#555;margin-top:6px'>{cstatus}</div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1515,26 +1614,29 @@ with tab_scan:
                 save_sent_new_restaurants(new_sent_slugs)
                 if notified:
                     total_novi = sum(len(v) for v in novi_po_gradu.values())
-                    st.info(f"📬 Poslato **{notified}** bulk obaveštenja sales agentima ({total_novi} novih restorana).")
+                    st.info(f"📬 Sent **{notified}** bulk notifications to sales agents ({total_novi} new restaurants).")
             m, s = divmod(int(scan_duration), 60)
             scan_mode_done = st.session_state.get("scan_mode", "full")
             if scan_mode_done == "nopromo":
                 newly_found = len(df_result[df_result["akcije"] != "-"])
-                st.success(f"✅ No Promo Scan završen za **{m:02d}:{s:02d}**! Od prethodno preskočenih, **{newly_found}** restorana sada ima akcije.")
+                st.success(f"✅ No Promo Scan finished in **{m:02d}:{s:02d}**! Of previously skipped restaurants, **{newly_found}** now have promotions.")
+            elif scan_mode_done == "city_rescan":
+                city_rows = len(df_result[df_result["grad"].isin(st.session_state.get("_city_rescan_cities", []))])
+                st.success(f"✅ City Rescan finished in **{m:02d}:{s:02d}**! Total: **{len(df_result)}** restaurants, **{len(df_result[df_result['akcije'] != '-'])}** with promotions.")
             else:
-                st.success(f"✅ Full Scan završen za **{m:02d}:{s:02d}**! Pronađeno **{len(df_result)}** restorana, **{len(df_result[df_result['akcije'] != '-'])}** sa akcijama.")
+                st.success(f"✅ Full Scan finished in **{m:02d}:{s:02d}**! Found **{len(df_result)}** restaurants, **{len(df_result[df_result['akcije'] != '-'])}** with promotions.")
             st.rerun()
         else:
             if _stop_ev.is_set():
-                st.warning("⏹️ Scan je zaustavljen.")
+                st.warning("⏹️ Scan was stopped.")
             else:
-                st.error("❌ Scan nije vratio podatke.")
+                st.error("❌ Scan returned no data.")
 
     df = st.session_state.df_wolt
     if not df.empty:
         if st.session_state.scan_duration_last:
             m_t, s_t = divmod(int(st.session_state.scan_duration_last), 60)
-            st.markdown(f"<div style='background:#e8f8f0;border-left:4px solid #27ae60;padding:8px 16px;border-radius:6px;margin-bottom:12px;font-size:0.95rem;color:#155724'>⏱️ Poslednji sken trajao: <strong>{m_t:02d}:{s_t:02d}</strong></div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='background:#e8f8f0;border-left:4px solid #27ae60;padding:8px 16px;border-radius:6px;margin-bottom:12px;font-size:0.95rem;color:#155724'>⏱️ Last scan duration: <strong>{m_t:02d}:{s_t:02d}</strong></div>", unsafe_allow_html=True)
         st.markdown("---")
 
         k1, k2, k3, k4, k5 = st.columns(5)
@@ -1545,52 +1647,52 @@ with tab_scan:
         sa_wolt_plus = len(df[df["akcije"].apply(lambda c: bool(re.search(r'\[Wolt\+\]|Wolt\+|W\+', c, re.IGNORECASE)) if pd.notna(c) else False)])
 
         for col, val, lbl in [
-            (k1, total, "Ukupno restorana"), (k2, sa_akcijama, "Ima akciju"),
-            (k3, sa_wolt_plus, "💙 Wolt+ akcije"),
-            (k4, otvoreni, "Trenutno otvoreno"), (k5, novi, "Novi restorani"),
+            (k1, total, "Total restaurants"), (k2, sa_akcijama, "Has promotion"),
+            (k3, sa_wolt_plus, "💙 Wolt+ promotions"),
+            (k4, otvoreni, "Currently open"), (k5, novi, "New restaurants"),
         ]:
             with col:
                 st.markdown(f"<div class='kpi'><div class='kpi-val'>{val}</div><div class='kpi-lbl'>{lbl}</div></div>", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         grad_summary = df.groupby("grad").agg(
-            Restorana=("naziv", "count"),
-            Sa_akcijama=("akcije", lambda x: (x != "-").sum()),
-            Otvoreni=("status", lambda x: (x == "Otvoren").sum()),
+            Restaurants=("naziv", "count"),
+            With_promos=("akcije", lambda x: (x != "-").sum()),
+            Open=("status", lambda x: (x == "Otvoren").sum()),
         ).reset_index()
         gs_cols = st.columns(len(grad_summary))
         for i, row in grad_summary.iterrows():
             with gs_cols[i]:
-                pct = int(row["Sa_akcijama"] / row["Restorana"] * 100) if row["Restorana"] > 0 else 0
+                pct = int(row["With_promos"] / row["Restaurants"] * 100) if row["Restaurants"] > 0 else 0
                 st.markdown(f"""
                 <div style='background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 2px 8px rgba(0,0,0,0.07);border-top:3px solid #009de0;text-align:center'>
                   <div style='font-weight:800;color:#009de0;font-size:1rem'>{row["grad"]}</div>
-                  <div style='font-size:1.6rem;font-weight:900'>{int(row["Restorana"])}</div>
-                  <div style='font-size:0.75rem;color:#888'>restorana</div>
-                  <div style='margin-top:4px;font-size:0.85rem;color:#27ae60'>{int(row["Sa_akcijama"])} akcija ({pct}%)</div>
-                  <div style='font-size:0.75rem;color:#555'>{int(row["Otvoreni"])} otvorenih</div>
+                  <div style='font-size:1.6rem;font-weight:900'>{int(row["Restaurants"])}</div>
+                  <div style='font-size:0.75rem;color:#888'>restaurants</div>
+                  <div style='margin-top:4px;font-size:0.85rem;color:#27ae60'>{int(row["With_promos"])} promos ({pct}%)</div>
+                  <div style='font-size:0.75rem;color:#555'>{int(row["Open"])} open</div>
                 </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Filteri — kompaktno u dva reda ───────────────────────────────────
+        # ── Filters ──────────────────────────────────────────────────────────
         ff1, ff2, ff3, ff4, ff5, ff6 = st.columns([2, 1, 1, 1, 1, 2])
-        with ff1: grad_filter = st.multiselect("📍 Grad:", CITIES, default=CITIES, key="scan_grad")
-        with ff2: samo_akcije = st.checkbox("📌 Sa akcijama", value=False, key="scan_akcije")
+        with ff1: grad_filter = st.multiselect("📍 City:", CITIES, default=CITIES, key="scan_grad")
+        with ff2: samo_akcije = st.checkbox("📌 With promos", value=False, key="scan_akcije")
         with ff3: samo_wolt_plus = st.checkbox("💙 Wolt+", value=False, key="scan_wolt_plus")
-        with ff4: samo_pct_popust = st.checkbox("🔢 % popust", value=False, key="scan_pct_popust")
-        with ff5: samo_otvoreni = st.checkbox("🟢 Otvoreni", value=False, key="scan_otvoreni")
-        with ff6: search = st.text_input("🔎 Pretraži naziv:", key="scan_search", placeholder="naziv restorana...")
+        with ff4: samo_pct_popust = st.checkbox("🔢 % discount", value=False, key="scan_pct_popust")
+        with ff5: samo_otvoreni = st.checkbox("🟢 Open", value=False, key="scan_otvoreni")
+        with ff6: search = st.text_input("🔎 Search name:", key="scan_search", placeholder="restaurant name...")
 
         ff7, ff8 = st.columns([1, 3])
-        with ff7: samo_novi = st.checkbox("🆕 Samo novi restorani", value=False, key="scan_novi")
+        with ff7: samo_novi = st.checkbox("🆕 New only", value=False, key="scan_novi")
         with ff8:
             sve_akcije_tekst = sorted(set(
                 line.lstrip("• ").strip()
                 for akcije_cell in df["akcije"] if akcije_cell != "-"
                 for line in akcije_cell.split("\n") if line.strip() and line.strip() != "-"
             ))
-            akcija_filter = st.multiselect("🎯 Filtriraj po tipu akcije:", options=sve_akcije_tekst, default=[], key="scan_akcija_filter", placeholder="Sve akcije...")
+            akcija_filter = st.multiselect("🎯 Filter by promo type:", options=sve_akcije_tekst, default=[], key="scan_akcija_filter", placeholder="All promotions...")
 
         fdf = df[df["grad"].isin(grad_filter)]
         if samo_akcije: fdf = fdf[fdf["akcije"] != "-"]
@@ -1608,27 +1710,27 @@ with tab_scan:
         display_cols = [c for c in display_cols if c in fdf.columns]
         st.dataframe(fdf[display_cols].reset_index(drop=True), use_container_width=True, hide_index=True, height=480,
             column_config={
-                "grad": st.column_config.TextColumn("Grad"), "naziv": st.column_config.TextColumn("Restoran"),
-                "status": st.column_config.TextColumn("Status"), "ocena": st.column_config.TextColumn("Ocena"),
-                "dostava": st.column_config.TextColumn("Dostava"), "novo": st.column_config.TextColumn("Novi"),
-                "akcije": st.column_config.TextColumn("Akcije", width="large"),
-                "link": st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
+                "grad": st.column_config.TextColumn("City"), "naziv": st.column_config.TextColumn("Restaurant"),
+                "status": st.column_config.TextColumn("Status"), "ocena": st.column_config.TextColumn("Rating"),
+                "dostava": st.column_config.TextColumn("Delivery"), "novo": st.column_config.TextColumn("New"),
+                "akcije": st.column_config.TextColumn("Promotions", width="large"),
+                "link": st.column_config.LinkColumn("Link", display_text="Open ↗"),
             })
         csv = fdf[display_cols].to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Preuzmi CSV", csv, "scan.csv", "text/csv")
+        st.download_button("📥 Download CSV", csv, "scan.csv", "text/csv")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: AMM BAZA
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_amm:
-    st.markdown("### 👥 Baza Account Managera")
-    st.caption("Definiši koji AM je zadužen za koji restoran. Čuva se na Google Sheets-u (tab `amm_baza`).")
+    st.markdown("### 👥 Account Manager Database")
+    st.caption("Define which AM is responsible for which restaurant. Stored in Google Sheets (tab `amm_baza`).")
 
     amm_df  = load_amm()
     df_wolt = st.session_state.df_wolt
 
     st.markdown("---")
-    st.markdown("#### 📬 Sales agenti po gradu")
+    st.markdown("#### 📬 Sales agents by city")
     sales_data = load_sales()
 
     for city in CITIES:
@@ -1643,39 +1745,39 @@ with tab_amm:
                 parsed = [e.strip() for e in new_emails_str.split(",") if e.strip()]
                 sales_data[city] = parsed
                 save_sales(sales_data)
-                st.success(f"✅ {city}: {len(parsed)} email(a) sačuvano.")
+                st.success(f"✅ {city}: {len(parsed)} email(s) saved.")
                 st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ⚡ Bulk dodela")
+    st.markdown("#### ⚡ Bulk assign")
 
     if df_wolt.empty:
-        st.info("Pokreni scan prvo da bi se restorani prikazali.")
+        st.info("Run a scan first to see restaurants.")
     else:
         bulk_am_opts = sorted(amm_df["am_name"].dropna().unique().tolist()) if not amm_df.empty else []
         if not bulk_am_opts:
-            st.warning("Nema AM-ova u bazi. Dodaj AM-a ispod pa se vrati ovde.")
+            st.warning("No AMs in the database. Add an AM below and come back.")
         else:
             b_col1, b_col2 = st.columns([1, 3])
-            with b_col1: bulk_selected_am = st.selectbox("Izaberi AM:", bulk_am_opts, key="bulk_am_sel")
-            with b_col2: bulk_grad = st.multiselect("Filtriraj po gradu:", CITIES, default=CITIES, key="bulk_grad_filt")
+            with b_col1: bulk_selected_am = st.selectbox("Select AM:", bulk_am_opts, key="bulk_am_sel")
+            with b_col2: bulk_grad = st.multiselect("Filter by city:", CITIES, default=CITIES, key="bulk_grad_filt")
 
             if bulk_selected_am:
                 am_row = amm_df[amm_df["am_name"] == bulk_selected_am].iloc[0]
                 am_email_bulk = am_row["am_email"]
                 bulk_df = df_wolt[df_wolt["grad"].isin(bulk_grad)][["naziv", "grad"]].drop_duplicates().copy()
                 already = amm_df[amm_df["am_name"] == bulk_selected_am]["restaurant_display"].tolist()
-                bulk_df["✅ Dodeli"] = bulk_df["naziv"].isin(already)
+                bulk_df["✅ Assign"] = bulk_df["naziv"].isin(already)
                 edited_bulk = st.data_editor(bulk_df.reset_index(drop=True), use_container_width=True,
                     hide_index=True, height=400,
                     column_config={
-                        "✅ Dodeli": st.column_config.CheckboxColumn("Dodeli ovom AM-u", default=False),
-                        "naziv": st.column_config.TextColumn("Restoran", disabled=True),
-                        "grad": st.column_config.TextColumn("Grad", disabled=True),
+                        "✅ Assign": st.column_config.CheckboxColumn("Assign to this AM", default=False),
+                        "naziv": st.column_config.TextColumn("Restaurant", disabled=True),
+                        "grad": st.column_config.TextColumn("City", disabled=True),
                     }, key="bulk_editor")
 
-                if st.button("💾 Sačuvaj bulk dodelu", key="bulk_save"):
-                    selected_rows = edited_bulk[edited_bulk["✅ Dodeli"] == True]
+                if st.button("💾 Save bulk assignment", key="bulk_save"):
+                    selected_rows = edited_bulk[edited_bulk["✅ Assign"] == True]
                     new_rows = []
                     for _, row in selected_rows.iterrows():
                         norm = normalize(row["naziv"])
@@ -1689,32 +1791,32 @@ with tab_amm:
                     if new_rows:
                         amm_df = pd.concat([amm_df, pd.DataFrame(new_rows)], ignore_index=True)
                     save_amm(amm_df)
-                    st.success(f"✅ Dodeljeno {len(selected_rows)} restorana → {bulk_selected_am}")
+                    st.success(f"✅ Assigned {len(selected_rows)} restaurants → {bulk_selected_am}")
                     st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ➕ Dodaj / ažuriraj pojedinačno")
+    st.markdown("#### ➕ Add / update individually")
 
     rest_options = sorted(df_wolt["naziv"].dropna().unique().tolist()) if not df_wolt.empty else []
     a1, a2 = st.columns([2, 1])
-    with a1: sel_rest = st.selectbox("Restoran:", ["-- Odaberi --"] + rest_options, key="amm_sel")
-    with a2: man_rest = st.text_input("Ili upiši ručno:", placeholder="npr. KFC", key="amm_man")
+    with a1: sel_rest = st.selectbox("Restaurant:", ["-- Select --"] + rest_options, key="amm_sel")
+    with a2: man_rest = st.text_input("Or type manually:", placeholder="e.g. KFC", key="amm_man")
 
-    final_rest = man_rest.strip() if man_rest.strip() else (sel_rest if sel_rest != "-- Odaberi --" else "")
+    final_rest = man_rest.strip() if man_rest.strip() else (sel_rest if sel_rest != "-- Select --" else "")
     b1, b2, b3, b4 = st.columns(4)
-    with b1: amm_city  = st.selectbox("Grad:", ["-- Svi --"] + CITIES, key="amm_city_sel")
-    with b2: amm_name  = st.text_input("Ime AM-a:", key="amm_name")
-    with b3: amm_email = st.text_input("Email AM-a:", key="amm_email")
+    with b1: amm_city  = st.selectbox("City:", ["-- All --"] + CITIES, key="amm_city_sel")
+    with b2: amm_name  = st.text_input("AM Name:", key="amm_name")
+    with b3: amm_email = st.text_input("AM Email:", key="amm_email")
     with b4:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("💾 Sačuvaj", use_container_width=True, key="amm_save"):
+        if st.button("💾 Save", use_container_width=True, key="amm_save"):
             if not final_rest:
-                st.error("Izaberi ili upiši naziv restorana.")
+                st.error("Select or type a restaurant name.")
             elif not amm_name or not amm_email:
-                st.error("Upiši ime i email AM-a.")
+                st.error("Enter AM name and email.")
             else:
                 norm = normalize(final_rest)
-                city_val = "" if amm_city == "-- Svi --" else amm_city
+                city_val = "" if amm_city == "-- All --" else amm_city
                 mask = (amm_df["restaurant_norm"] == norm) & (amm_df["city"] == city_val)
                 if mask.any():
                     amm_df.loc[mask, ["restaurant_display", "am_name", "am_email"]] = [final_rest, amm_name, amm_email]
@@ -1722,60 +1824,60 @@ with tab_amm:
                     amm_df = pd.concat([amm_df, pd.DataFrame([{"restaurant_norm": norm, "restaurant_display": final_rest,
                                         "city": city_val, "am_name": amm_name, "am_email": amm_email}])], ignore_index=True)
                 save_amm(amm_df)
-                st.success(f"✅ Sačuvano na Google Sheets: **{final_rest}** → {amm_name}")
+                st.success(f"✅ Saved to Google Sheets: **{final_rest}** → {amm_name}")
                 st.rerun()
 
     st.markdown("---")
-    st.markdown("#### 📋 Trenutna baza")
+    st.markdown("#### 📋 Current database")
     if amm_df.empty:
-        st.info("Baza je prazna.")
+        st.info("Database is empty.")
     else:
-        am_opts = ["Svi"] + sorted(amm_df["am_name"].dropna().unique().tolist())
-        am_filt = st.selectbox("Filtriraj po AM-u:", am_opts, key="amm_view_filt")
-        view = amm_df if am_filt == "Svi" else amm_df[amm_df["am_name"] == am_filt]
+        am_opts = ["All"] + sorted(amm_df["am_name"].dropna().unique().tolist())
+        am_filt = st.selectbox("Filter by AM:", am_opts, key="amm_view_filt")
+        view = amm_df if am_filt == "All" else amm_df[amm_df["am_name"] == am_filt]
         edited = st.data_editor(view.reset_index(drop=True), use_container_width=True, num_rows="dynamic",
             hide_index=True, column_config={
-                "restaurant_norm": st.column_config.TextColumn("Norm naziv", disabled=True),
-                "restaurant_display": st.column_config.TextColumn("Restoran"),
-                "city": st.column_config.TextColumn("Grad"),
-                "am_name": st.column_config.TextColumn("Ime AM-a"),
-                "am_email": st.column_config.TextColumn("Email AM-a"),
+                "restaurant_norm": st.column_config.TextColumn("Norm name", disabled=True),
+                "restaurant_display": st.column_config.TextColumn("Restaurant"),
+                "city": st.column_config.TextColumn("City"),
+                "am_name": st.column_config.TextColumn("AM Name"),
+                "am_email": st.column_config.TextColumn("AM Email"),
             }, key="amm_editor")
-        if st.button("💾 Sačuvaj izmene", key="amm_save_tbl"):
-            if am_filt == "Svi":
+        if st.button("💾 Save changes", key="amm_save_tbl"):
+            if am_filt == "All":
                 save_amm(edited)
             else:
                 rest_df = amm_df[amm_df["am_name"] != am_filt]
                 save_amm(pd.concat([rest_df, edited], ignore_index=True))
-            st.success("✅ Baza ažurirana na Google Sheets!")
+            st.success("✅ Database updated on Google Sheets!")
             st.rerun()
 
     st.markdown("---")
     st.markdown("#### 📥 Bulk import CSV")
-    uploaded = st.file_uploader("CSV fajl:", type="csv", key="amm_upload")
+    uploaded = st.file_uploader("CSV file:", type="csv", key="amm_upload")
     if uploaded:
         try:
             new_df = pd.read_csv(uploaded)
             new_df["restaurant_norm"] = new_df["restaurant_display"].apply(normalize)
             merged_amm = pd.concat([amm_df, new_df], ignore_index=True).drop_duplicates(subset=["restaurant_norm", "city"], keep="last")
             save_amm(merged_amm)
-            st.success(f"✅ Importovano {len(new_df)} redova.")
+            st.success(f"✅ Imported {len(new_df)} rows.")
             st.rerun()
         except Exception as e:
-            st.error(f"Greška: {e}")
+            st.error(f"Error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3: POŠALJI ALERT
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_alert:
-    st.markdown("### 📧 Pošalji Alert AM-ovima")
+    st.markdown("### 📧 Send Alert to AMs")
     df_wolt = st.session_state.df_wolt
     amm_df  = load_amm()
 
     if df_wolt.empty:
-        st.warning("⚠️ Nema scan podataka.")
+        st.warning("⚠️ No scan data available.")
     elif amm_df.empty:
-        st.warning("⚠️ AMM baza je prazna.")
+        st.warning("⚠️ AM database is empty.")
     else:
         df_wolt["naziv_norm"] = df_wolt["naziv"].apply(normalize)
         merged = df_wolt.merge(
@@ -1786,26 +1888,26 @@ with tab_alert:
         sa_akcijama = merged[merged["_alert"]].copy()
 
         if sa_akcijama.empty:
-            st.info("✅ Nijedan partner trenutno nema relevantne akcije.")
+            st.info("✅ None of your partners currently have relevant promotions.")
         else:
             sa_akcijama["akcije_email"] = sa_akcijama["akcije"].apply(filter_akcije_for_email)
             af1, af2 = st.columns(2)
-            with af1: grad_filt_a = st.multiselect("Grad:", CITIES, default=CITIES, key="alert_grad")
+            with af1: grad_filt_a = st.multiselect("City:", CITIES, default=CITIES, key="alert_grad")
             with af2: am_filt_a = st.multiselect("AM:", sorted(sa_akcijama["am_name"].dropna().unique().tolist()),
                                                   default=sorted(sa_akcijama["am_name"].dropna().unique().tolist()), key="alert_am")
             preview = sa_akcijama[(sa_akcijama["grad"].isin(grad_filt_a)) & (sa_akcijama["am_name"].isin(am_filt_a))]
-            st.caption(f"Partnera za alert: **{len(preview)}** | AM-ova: **{preview['am_name'].nunique()}**")
+            st.caption(f"Partners to alert: **{len(preview)}** | AMs: **{preview['am_name'].nunique()}**")
             preview_cols = ["grad", "naziv", "am_name", "am_email", "akcije_email", "link"]
             preview_cols = [c for c in preview_cols if c in preview.columns]
             st.dataframe(preview[preview_cols].reset_index(drop=True), use_container_width=True, hide_index=True, height=350,
                 column_config={
-                    "grad": st.column_config.TextColumn("Grad"), "naziv": st.column_config.TextColumn("Restoran"),
+                    "grad": st.column_config.TextColumn("City"), "naziv": st.column_config.TextColumn("Restaurant"),
                     "am_name": st.column_config.TextColumn("AM"), "am_email": st.column_config.TextColumn("Email"),
-                    "akcije_email": st.column_config.TextColumn("Akcije", width="large"),
-                    "link": st.column_config.LinkColumn("Link", display_text="Otvori ↗"),
+                    "akcije_email": st.column_config.TextColumn("Promotions", width="large"),
+                    "link": st.column_config.LinkColumn("Link", display_text="Open ↗"),
                 })
             st.markdown("---")
-            if st.button("🚀 Pošalji alertove", type="primary"):
+            if st.button("🚀 Send alerts", type="primary"):
                 cooldown = load_alert_cooldown()
                 am_groups = preview.groupby(["am_name", "am_email"])
                 sent_log = []
@@ -1828,88 +1930,146 @@ with tab_alert:
                     ok = send_alert_email(am_email_addr, am_name, alerts)
                     if ok:
                         success_count += 1
-                        st.success(f"✅ Mail poslat: **{am_name}** – {len(alerts)} partnera")
+                        st.success(f"✅ Email sent: **{am_name}** – {len(alerts)} partners")
                         for a in alerts:
                             update_cooldown(am_email_addr, a["norm"], cooldown)
                             sent_log.append({"timestamp": local_now(), "city": a["grad"],
                                             "restaurant_display": a["naziv"], "am_name": am_name,
                                             "am_email": am_email_addr, "akcije": a["akcije"]})
                     else:
-                        st.error(f"❌ Greška: {am_name}")
+                        st.error(f"❌ Error: {am_name}")
                 save_alert_cooldown(cooldown)
                 if sent_log:
                     append_alert_log(sent_log)
                 if skipped_count:
-                    st.info(f"ℹ️ {skipped_count} partnera preskočeno (cooldown {COOLDOWN_DAYS} dana).")
-                st.markdown(f"**Završeno:** {success_count}/{am_groups.ngroups} AM-ova kontaktirano.")
+                    st.info(f"ℹ️ {skipped_count} partners skipped (cooldown {COOLDOWN_DAYS} days).")
+                st.markdown(f"**Done:** {success_count}/{am_groups.ngroups} AMs contacted.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4: STATISTIKA
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_stats:
-    st.markdown("### 📈 Statistika alerta po Account Manageru")
+    st.markdown("### 📈 Alert Statistics by Account Manager")
     log_df = load_alert_log()
     if log_df.empty:
-        st.info("Još nema poslatih alerta.")
+        st.info("No alerts have been sent yet.")
     else:
         log_df["timestamp"] = pd.to_datetime(log_df["timestamp"], errors="coerce")
         min_d = log_df["timestamp"].min().date()
         max_d = log_df["timestamp"].max().date()
         s1, s2 = st.columns(2)
-        with s1: date_from = st.date_input("Od:", min_d, key="s_from")
-        with s2: date_to   = st.date_input("Do:", max_d, key="s_to")
+        with s1: date_from = st.date_input("From:", min_d, key="s_from")
+        with s2: date_to   = st.date_input("To:", max_d, key="s_to")
         flog = log_df[(log_df["timestamp"].dt.date >= date_from) & (log_df["timestamp"].dt.date <= date_to)]
         if flog.empty:
-            st.warning("Nema podataka za period.")
+            st.warning("No data for this period.")
         else:
             k1, k2, k3, k4 = st.columns(4)
             for col, val, lbl, color in [
-                (k1, len(flog), "Ukupno alerta", "#009de0"),
-                (k2, flog["am_name"].nunique(), "AM-ova", "#8e44ad"),
-                (k3, flog["restaurant_display"].nunique(), "Restorana", "#27ae60"),
-                (k4, flog["timestamp"].dt.date.nunique(), "Dana sa alertima", "#e67e22"),
+                (k1, len(flog), "Total alerts", "#009de0"),
+                (k2, flog["am_name"].nunique(), "AMs", "#8e44ad"),
+                (k3, flog["restaurant_display"].nunique(), "Restaurants", "#27ae60"),
+                (k4, flog["timestamp"].dt.date.nunique(), "Days with alerts", "#e67e22"),
             ]:
                 with col:
                     st.markdown(f"<div class='kpi' style='border-top:4px solid {color}'><div class='kpi-val' style='color:{color}'>{val}</div><div class='kpi-lbl'>{lbl}</div></div>", unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
             am_stats = (flog.groupby(["am_name", "am_email"]).agg(
-                Slanja=("timestamp", lambda x: x.dt.date.nunique()),
-                Restorana=("restaurant_display", "nunique"),
-                Ukupno_alerta=("restaurant_display", "count"),
-                Poslednji=("timestamp", "max"),
-            ).reset_index().rename(columns={"am_name": "AM", "am_email": "Email"}).sort_values("Ukupno_alerta", ascending=False))
-            am_stats["Poslednji"] = am_stats["Poslednji"].dt.strftime("%d.%m.%Y %H:%M")
+                Sends=("timestamp", lambda x: x.dt.date.nunique()),
+                Restaurants=("restaurant_display", "nunique"),
+                Total_alerts=("restaurant_display", "count"),
+                Last=("timestamp", "max"),
+            ).reset_index().rename(columns={"am_name": "AM", "am_email": "Email"}).sort_values("Total_alerts", ascending=False))
+            am_stats["Last"] = am_stats["Last"].dt.strftime("%d.%m.%Y %H:%M")
             st.dataframe(am_stats, use_container_width=True, hide_index=True)
 
             st.markdown("---")
-            am_log_sel = st.selectbox("Filtriraj po AM-u:", ["Svi"] + sorted(flog["am_name"].dropna().unique().tolist()), key="log_am_sel")
-            log_view = flog if am_log_sel == "Svi" else flog[flog["am_name"] == am_log_sel]
+            am_log_sel = st.selectbox("Filter by AM:", ["All"] + sorted(flog["am_name"].dropna().unique().tolist()), key="log_am_sel")
+            log_view = flog if am_log_sel == "All" else flog[flog["am_name"] == am_log_sel]
             log_view = log_view.sort_values("timestamp", ascending=False).copy()
             log_view["timestamp"] = log_view["timestamp"].dt.strftime("%d.%m.%Y %H:%M")
             st.dataframe(log_view, use_container_width=True, hide_index=True, height=400)
-            st.download_button("📥 Eksportuj log", log_view.to_csv(index=False).encode("utf-8"), "alert_log.csv", "text/csv")
+            st.download_button("📥 Export log", log_view.to_csv(index=False).encode("utf-8"), "alert_log.csv", "text/csv")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5: AUTO-SCHEDULER
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_sched:
-    st.markdown("### ⏰ Automatski dnevni sken i slanje")
+    st.markdown("### ⏰ Automatic Scan Scheduler")
     cfg = load_scheduler_config()
+
+    # ── GLOBAL / FULL SCAN schedule ──────────────────────────────────────────
+    st.markdown("#### 🌍 Global Full Scan")
+    st.caption("Runs a full scan across selected cities at a fixed daily time.")
     sc1, sc2, sc3 = st.columns(3)
-    with sc1: sched_enabled = st.toggle("✅ Uključi automatsko slanje", value=cfg.get("enabled", False))
-    with sc2: sched_hour = st.number_input("Sat (0–23):", min_value=0, max_value=23, value=cfg.get("hour", 8))
-    with sc3: sched_min = st.number_input("Minut (0–59):", min_value=0, max_value=59, value=cfg.get("minute", 0))
-    sched_cities = st.multiselect("Gradovi:", options=CITIES, default=cfg.get("cities", CITIES))
-    if st.button("💾 Sačuvaj podešavanja", type="primary"):
-        save_scheduler_config({"enabled": sched_enabled, "hour": int(sched_hour), "minute": int(sched_min), "cities": sched_cities})
-        st.success(f"✅ Sačuvano! Automatski sken {'UKLJUČEN' if sched_enabled else 'ISKLJUČEN'} u **{int(sched_hour):02d}:{int(sched_min):02d}**.")
+    with sc1: sched_enabled = st.toggle("✅ Enable global scan", value=cfg.get("enabled", False))
+    with sc2: sched_hour = st.number_input("Hour (0–23):", min_value=0, max_value=23, value=cfg.get("hour", 8))
+    with sc3: sched_min = st.number_input("Minute (0–59):", min_value=0, max_value=59, value=cfg.get("minute", 0))
+    sched_cities = st.multiselect("Cities:", options=CITIES, default=cfg.get("cities", CITIES))
+    if st.button("💾 Save global schedule", type="primary"):
+        new_cfg = dict(cfg)
+        new_cfg.update({"enabled": sched_enabled, "hour": int(sched_hour), "minute": int(sched_min), "cities": sched_cities})
+        save_scheduler_config(new_cfg)
+        st.success(f"✅ Saved! Global scan {'ENABLED' if sched_enabled else 'DISABLED'} at **{int(sched_hour):02d}:{int(sched_min):02d}**.")
 
     st.markdown("---")
-    st.markdown("#### 🧪 Test – pokreni ručno")
+
+    # ── PER-CITY schedules ───────────────────────────────────────────────────
+    st.markdown("#### 🏙️ Per-City Schedules")
+    st.caption("Set individual scan times and days for each city. These run City Rescan (merges with existing data).")
+
+    DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    DAY_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    city_schedules = cfg.get("city_schedules", {})
+
+    for city in CITIES:
+        city_cfg = city_schedules.get(city, {"enabled": False, "hour": 8, "minute": 0, "days": []})
+        with st.expander(f"🏙️ {city}", expanded=city_cfg.get("enabled", False)):
+            cc1, cc2, cc3 = st.columns(3)
+            with cc1:
+                city_enabled = st.toggle(f"Enable for {city}", value=city_cfg.get("enabled", False), key=f"city_en_{city}")
+            with cc2:
+                city_hour = st.number_input("Hour (0–23):", min_value=0, max_value=23,
+                                             value=city_cfg.get("hour", 8), key=f"city_h_{city}")
+            with cc3:
+                city_min = st.number_input("Minute (0–59):", min_value=0, max_value=59,
+                                            value=city_cfg.get("minute", 0), key=f"city_m_{city}")
+
+            st.markdown("**Days of week:**")
+            day_cols = st.columns(7)
+            selected_days = []
+            for di, (short, full) in enumerate(zip(DAYS, DAY_FULL)):
+                with day_cols[di]:
+                    checked = st.checkbox(short, value=(short in city_cfg.get("days", [])),
+                                          key=f"city_day_{city}_{short}", help=full)
+                    if checked:
+                        selected_days.append(short)
+
+            if st.button(f"💾 Save {city}", key=f"city_save_{city}"):
+                new_cfg = dict(cfg)
+                if "city_schedules" not in new_cfg:
+                    new_cfg["city_schedules"] = {}
+                new_cfg["city_schedules"][city] = {
+                    "enabled": city_enabled,
+                    "hour": int(city_hour),
+                    "minute": int(city_min),
+                    "days": selected_days,
+                }
+                save_scheduler_config(new_cfg)
+                cfg = load_scheduler_config()
+                city_schedules = cfg.get("city_schedules", {})
+                days_str = ", ".join(selected_days) if selected_days else "no days selected"
+                st.success(f"✅ {city}: {'ENABLED' if city_enabled else 'DISABLED'} at **{int(city_hour):02d}:{int(city_min):02d}** on {days_str}")
+
+    st.markdown("---")
+
+    # ── Test run ─────────────────────────────────────────────────────────────
+    st.markdown("#### 🧪 Test – run manually now")
     sched_running = st.session_state.get("sched_running", False)
     sched_done    = st.session_state.get("sched_done", False)
-    if st.button("▶️ Pokreni test sken + slanje sada", disabled=sched_running):
+    if st.button("▶️ Run test scan + send now", disabled=sched_running):
         st.session_state["sched_running"] = True
         st.session_state["sched_done"] = False
         def _run_sched_bg():
@@ -1919,14 +2079,16 @@ with tab_sched:
         threading.Thread(target=_run_sched_bg, daemon=True).start()
         st.rerun()
     if sched_running:
-        st.info("🔄 U toku...")
+        st.info("🔄 Running...")
         time.sleep(3)
         st.rerun()
     if sched_done:
         st.session_state["sched_done"] = False
-        st.success("✅ Test završen.")
+        st.success("✅ Test finished.")
 
     st.markdown("---")
+
+    # ── Status ───────────────────────────────────────────────────────────────
     cfg_cur = load_scheduler_config()
     if cfg_cur.get("enabled"):
         now = datetime.datetime.now()
@@ -1936,47 +2098,59 @@ with tab_sched:
         diff = target - now
         h, rem = divmod(int(diff.total_seconds()), 3600)
         m_rem = rem // 60
-        st.success(f"🕐 Sledeći automatski sken za: **{h}h {m_rem}min** (u {cfg_cur['hour']:02d}:{cfg_cur['minute']:02d})")
+        st.success(f"🕐 Next global scan in: **{h}h {m_rem}min** (at {cfg_cur['hour']:02d}:{cfg_cur['minute']:02d})")
     else:
-        st.warning("Automatski sken je isključen.")
+        st.warning("Global automatic scan is disabled.")
+
+    # ── Per-city next-run summary ─────────────────────────────────────────────
+    city_scheds_cur = cfg_cur.get("city_schedules", {})
+    active_city_scheds = {c: s for c, s in city_scheds_cur.items() if s.get("enabled") and s.get("days")}
+    if active_city_scheds:
+        st.markdown("**Active per-city schedules:**")
+        now = datetime.datetime.now()
+        cur_day_idx = now.weekday()  # 0=Mon
+        day_idx = {d: i for i, d in enumerate(DAYS)}
+        for city, cs in active_city_scheds.items():
+            days_str = ", ".join(cs["days"])
+            st.info(f"🏙️ **{city}** — {cs['hour']:02d}:{cs['minute']:02d} on {days_str}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6: DEBUG API
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_debug:
-    st.markdown("### 🔧 Debug & Podešavanja")
+    st.markdown("### ⚙️ Settings & Debug")
 
-    _debug_pass = st.text_input("🔑 Lozinka za pristup:", type="password", key="debug_pass_input")
+    _debug_pass = st.text_input("🔑 Password to access:", type="password", key="debug_pass_input")
     if _debug_pass != "zekapeka":
-        st.warning("Unesite lozinku za pristup Debug tabu.")
+        st.warning("Enter the password to access Settings.")
         st.stop()
 
     st.markdown("#### 📊 Google Sheets Status")
     try:
         client = get_gsheet_client()
         sh = client.open_by_key(GSHEET_ID)
-        st.success(f"✅ Google Sheets konekcija OK — Sheet: **{sh.title}**")
+        st.success(f"✅ Google Sheets connection OK — Sheet: **{sh.title}**")
         tabs = [ws.title for ws in sh.worksheets()]
-        st.info(f"Tabovi u Sheetu: {', '.join(tabs)}")
+        st.info(f"Tabs in Sheet: {', '.join(tabs)}")
     except Exception as e:
-        st.error(f"❌ Google Sheets greška: {e}")
+        st.error(f"❌ Google Sheets error: {e}")
 
     st.markdown("---")
-    st.markdown("#### 📍 Lokacije po gradu")
+    st.markdown("#### 📍 Locations per city")
     if "custom_coords" not in st.session_state:
         st.session_state["custom_coords"] = {k: list(v) for k, v in CITY_MULTI_COORDS.items()}
 
     for city_key in CITY_KEYS:
         city_disp = CITY_DISPLAY.get(city_key, city_key)
         coords_list = st.session_state["custom_coords"].get(city_key, [])
-        with st.expander(f"📍 {city_disp} — {len(coords_list)} lokacija", expanded=False):
+        with st.expander(f"📍 {city_disp} — {len(coords_list)} locations", expanded=False):
             coords_text = "\n".join(f"{lat}, {lon}" for lat, lon in coords_list)
-            new_text = st.text_area(f"Koordinate za {city_disp}:", value=coords_text,
+            new_text = st.text_area(f"Coordinates for {city_disp}:", value=coords_text,
                                     height=max(120, len(coords_list) * 35 + 40),
                                     key=f"coords_input_{city_key}", label_visibility="collapsed")
             col_save_c, col_reset_c = st.columns(2)
             with col_save_c:
-                if st.button("💾 Sačuvaj koordinate", key=f"save_coords_{city_key}"):
+                if st.button("💾 Save coordinates", key=f"save_coords_{city_key}"):
                     parsed_coords = []
                     errors = []
                     for i, line in enumerate(new_text.strip().split("\n")):
@@ -1990,31 +2164,31 @@ with tab_debug:
                                 if -90 <= lat_v <= 90 and -180 <= lon_v <= 180:
                                     parsed_coords.append((lat_v, lon_v))
                                 else:
-                                    errors.append(f"Red {i+1}: van opsega")
+                                    errors.append(f"Row {i+1}: out of range")
                             else:
-                                errors.append(f"Red {i+1}: format nije `lat, lon`")
+                                errors.append(f"Row {i+1}: format must be `lat, lon`")
                         except ValueError:
-                            errors.append(f"Red {i+1}: nije broj")
+                            errors.append(f"Row {i+1}: not a number")
                     if errors:
                         for err in errors: st.error(err)
                     elif not parsed_coords:
-                        st.error("Nema validnih koordinata.")
+                        st.error("No valid coordinates.")
                     else:
                         st.session_state["custom_coords"][city_key] = parsed_coords
-                        st.success(f"✅ {len(parsed_coords)} lokacija sačuvano.")
+                        st.success(f"✅ {len(parsed_coords)} locations saved.")
             with col_reset_c:
-                if st.button("↩️ Vrati default", key=f"reset_coords_{city_key}"):
+                if st.button("↩️ Reset to default", key=f"reset_coords_{city_key}"):
                     st.session_state["custom_coords"][city_key] = list(CITY_MULTI_COORDS[city_key])
-                    st.success("↩️ Resetovano.")
+                    st.success("↩️ Reset.")
                     st.rerun()
 
     st.markdown("---")
-    st.markdown("### 🔬 Sirovi API odgovor")
+    st.markdown("### 🔬 Raw API response")
     dc1, dc2 = st.columns([2, 1])
-    with dc1: debug_slug = st.text_input("Slug restorana:", placeholder="npr. mcdonalds-nis", key="debug_slug")
-    with dc2: debug_city_display = st.selectbox("Grad:", CITIES, key="debug_city")
+    with dc1: debug_slug = st.text_input("Restaurant slug:", placeholder="e.g. mcdonalds-nis", key="debug_slug")
+    with dc2: debug_city_display = st.selectbox("City:", CITIES, key="debug_city")
 
-    if st.button("🔍 Dohvati JSON", key="debug_fetch") and debug_slug:
+    if st.button("🔍 Fetch JSON", key="debug_fetch") and debug_slug:
         debug_city_key = display_to_key(debug_city_display)
         lat, lon  = CITY_COORDS.get(debug_city_key, (44.8178, 20.4569))
         city_slug = CITY_SLUG_MAP.get(debug_city_key, "belgrade")
@@ -2022,84 +2196,84 @@ with tab_debug:
                    f"?lat={lat}&lon={lon}&selected_delivery_method=homedelivery")
         dyn_data, dyn_status = wolt_get(dyn_url)
         if dyn_data:
-            with st.expander("Pun JSON", expanded=True):
+            with st.expander("Full JSON", expanded=True):
                 st.json(dyn_data)
             parsed = _parse_dynamic(dyn_data)
-            st.markdown("**Parsed akcije:**")
+            st.markdown("**Parsed promotions:**")
             for p in parsed: st.write(p)
-            if not parsed: st.warning("Nema parsiranih akcija.")
+            if not parsed: st.warning("No parsed promotions.")
         else:
-            st.warning(f"Nije vratio podatke. HTTP: {dyn_status}")
+            st.warning(f"No data returned. HTTP: {dyn_status}")
 
     st.markdown("---")
     st.markdown("### 📋 Fetch Debug Log")
     col_log1, col_log2 = st.columns(2)
     with col_log1:
-        if st.button("🔄 Osveži log"): st.rerun()
+        if st.button("🔄 Refresh log"): st.rerun()
     with col_log2:
-        if st.button("🗑️ Obriši log"):
+        if st.button("🗑️ Delete log"):
             Path("_fetch_debug.log").unlink(missing_ok=True)
-            st.success("Log obrisan.")
+            st.success("Log deleted.")
     try:
         log_content = Path("_fetch_debug.log").read_text(encoding="utf-8")
         if log_content.strip():
             lines = log_content.strip().split("\n")
             st.code("\n".join(lines[-200:]), language=None)
         else:
-            st.info("Log je prazan.")
+            st.info("Log is empty.")
     except FileNotFoundError:
-        st.info("Log ne postoji.")
+        st.info("Log does not exist.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 7: RESET & BACKUP
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_reset:
-    st.markdown("### 🗑️ Reset sistema")
+    st.markdown("### 🗑️ Reset System")
     RESET_PASSWORD = "zekapeka"
 
     st.markdown("#### 💾 Backup")
-    if st.button("📦 Kreiraj backup (CSV download)", key="backup_btn"):
+    if st.button("📦 Create backup (CSV download)", key="backup_btn"):
         df_wolt_bk = st.session_state.df_wolt
         if not df_wolt_bk.empty:
-            st.download_button("⬇️ Preuzmi scan CSV", df_wolt_bk.to_csv(index=False).encode("utf-8"),
+            st.download_button("⬇️ Download scan CSV", df_wolt_bk.to_csv(index=False).encode("utf-8"),
                                file_name=f"scan_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                                mime="text/csv", key="backup_scan_dl")
         amm_bk = load_amm()
         if not amm_bk.empty:
-            st.download_button("⬇️ Preuzmi AMM CSV", amm_bk.to_csv(index=False).encode("utf-8"),
+            st.download_button("⬇️ Download AM CSV", amm_bk.to_csv(index=False).encode("utf-8"),
                                file_name="amm_backup.csv", mime="text/csv", key="backup_amm_dl")
 
     st.markdown("---")
-    st.markdown("#### ⚠️ Reset operacije")
-    reset_pass = st.text_input("🔑 Lozinka:", type="password", key="reset_pass_input")
+    st.markdown("#### ⚠️ Reset operations")
+    reset_pass = st.text_input("🔑 Password:", type="password", key="reset_pass_input")
     pass_ok = reset_pass == RESET_PASSWORD
 
     r1, r2, r3, r4 = st.columns(4)
     with r1:
-        st.markdown("**Reset logova**")
-        if st.button("🗑️ Obriši logove", key="reset_logs", disabled=not pass_ok):
+        st.markdown("**Reset logs**")
+        if st.button("🗑️ Delete logs", key="reset_logs", disabled=not pass_ok):
             Path("_fetch_debug.log").unlink(missing_ok=True)
-            st.success("✅ Logovi obrisani.")
+            st.success("✅ Logs deleted.")
     with r2:
-        st.markdown("**Reset AMM baze**")
-        if st.button("🗑️ Obriši AMM bazu", key="reset_amm", disabled=not pass_ok):
+        st.markdown("**Reset AM database**")
+        if st.button("🗑️ Delete AM database", key="reset_amm", disabled=not pass_ok):
             empty_amm = pd.DataFrame(columns=AMM_COLS)
             save_amm(empty_amm)
-            st.success("✅ AMM baza obrisana.")
+            st.success("✅ AM database deleted.")
     with r3:
-        st.markdown("**Reset scan rezultata**")
-        if st.button("🗑️ Obriši scan", key="reset_scan", disabled=not pass_ok):
+        st.markdown("**Reset scan results**")
+        if st.button("🗑️ Delete scan", key="reset_scan", disabled=not pass_ok):
             st.session_state.df_wolt = pd.DataFrame()
             st.session_state.last_scan = None
             st.session_state.scan_duration_last = None
             SCAN_FILE.unlink(missing_ok=True)
             Path("_scan_result.json").unlink(missing_ok=True)
             save_scan_gsheet(pd.DataFrame())
-            st.success("✅ Scan obrisan.")
+            st.success("✅ Scan deleted.")
             st.rerun()
     with r4:
-        st.markdown("**Reset SVE**")
-        if st.button("💥 RESET SVE", key="reset_all", type="primary", disabled=not pass_ok):
+        st.markdown("**Reset EVERYTHING**")
+        if st.button("💥 RESET ALL", key="reset_all", type="primary", disabled=not pass_ok):
             st.session_state.df_wolt = pd.DataFrame()
             st.session_state.last_scan = None
             for f in ["_scan_result.json", "_scan_done.txt", "_scan_status.txt", "_scan_city_progress.json", "_fetch_debug.log"]:
@@ -2107,8 +2281,8 @@ with tab_reset:
             SCAN_FILE.unlink(missing_ok=True)
             save_amm(pd.DataFrame(columns=AMM_COLS))
             save_alert_log_gsheet(pd.DataFrame(columns=ALERT_COLS))
-            st.success("💥 Sve obrisano!")
+            st.success("💥 Everything deleted!")
             st.rerun()
 
     if reset_pass and not pass_ok:
-        st.error("❌ Pogrešna lozinka.")
+        st.error("❌ Wrong password.")
