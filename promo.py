@@ -12,8 +12,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
+import logging
 import gspread
 from google.oauth2.service_account import Credentials
+try:
+    from zoneinfo import ZoneInfo          # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
+
+# ─────────────────────────── VREMENSKA ZONA ──────────────────────────────────
+TZ_BEOGRAD = ZoneInfo("Europe/Belgrade")
+
+def now_beograd() -> datetime.datetime:
+    """Trenutno vreme u beogradskoj vremenskoj zoni."""
+    return datetime.datetime.now(tz=TZ_BEOGRAD)
+
+def today_beograd() -> datetime.date:
+    return now_beograd().date()
 
 # ─────────────────────────── KONFIGURACIJA ───────────────────────────────────
 
@@ -156,7 +172,7 @@ def normalize(name: str) -> str:
     return re.sub(r"[^\w]", "", str(name).lower())
 
 def local_now() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return now_beograd().strftime("%Y-%m-%d %H:%M:%S")
 
 def display_to_key(display_name: str) -> str:
     for key, disp in CITY_DISPLAY.items():
@@ -204,11 +220,29 @@ def _cache_set(key: str, value):
 
 def save_scan_gsheet(df: pd.DataFrame):
     try:
-        ws = get_sheet("scan_baza")
-        ws.clear()
+        client = get_gsheet_client()
+        sh = client.open_by_key(GSHEET_ID)
+        tmp_name = "_scan_baza_tmp"
+
+        # Piši u privremeni sheet — ako pukne na pola, pravi sheet ostaje netaknut
+        try:
+            tmp_ws = sh.worksheet(tmp_name)
+            tmp_ws.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            tmp_ws = sh.add_worksheet(title=tmp_name, rows=max(len(df) + 10, 100), cols=20)
+
         if not df.empty:
             data = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-            ws.update(data)
+            tmp_ws.update(data)
+
+        # Swap: obriši pravi, preimenuj tmp → scan_baza
+        try:
+            real_ws = sh.worksheet("scan_baza")
+            sh.del_worksheet(real_ws)
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+        tmp_ws.update_title("scan_baza")
+
     except Exception as e:
         st.warning(f"GSheet scan save greška: {e}")
     df.to_json(SCAN_FILE, orient="records", force_ascii=False)
@@ -242,7 +276,7 @@ def scan_meta_gsheet() -> str | None:
         return "dostupan (keš)"
     if SCAN_FILE.exists():
         mtime = SCAN_FILE.stat().st_mtime
-        return datetime.datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
+        return datetime.datetime.fromtimestamp(mtime, tz=TZ_BEOGRAD).strftime("%d.%m.%Y %H:%M:%S")
     return None
 
 # ── AMM ───────────────────────────────────────────────────────────────────────
@@ -402,7 +436,12 @@ def load_amm() -> pd.DataFrame:        return load_amm_gsheet()
 def save_amm(df):                       save_amm_gsheet(df)
 def load_alert_log() -> pd.DataFrame:  return load_alert_log_gsheet()
 def append_alert_log(rows):             append_alert_log_gsheet(rows)
-def save_scan(df):                      save_scan_gsheet(df)
+def save_scan(df):
+    # Fix 1: deduplikacija po slug-u pre snimanja — sprečava duplikate
+    # koji nastaju kada isti restoran bude pronađen iz više lokacija
+    if not df.empty and "slug" in df.columns:
+        df = df.drop_duplicates(subset=["slug"], keep="first").reset_index(drop=True)
+    save_scan_gsheet(df)
 def load_scan() -> pd.DataFrame:       return load_scan_gsheet()
 def scan_meta() -> str | None:         return scan_meta_gsheet()
 def load_sales() -> dict:              return load_sales_gsheet()
@@ -458,21 +497,25 @@ def save_sent_new_restaurants(slugs: set):
 
 # ─────────────────────────── AM ALERT COOLDOWN ───────────────────────────────
 
+_cooldown_lock = threading.Lock()
+
 def load_alert_cooldown() -> dict:
-    if ALERT_COOLDOWN_FILE.exists():
-        try:
-            return json.loads(ALERT_COOLDOWN_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    with _cooldown_lock:
+        if ALERT_COOLDOWN_FILE.exists():
+            try:
+                return json.loads(ALERT_COOLDOWN_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
 
 def save_alert_cooldown(cooldown: dict):
-    try:
-        tmp = Path(str(ALERT_COOLDOWN_FILE) + ".tmp")
-        tmp.write_text(json.dumps(cooldown, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(ALERT_COOLDOWN_FILE)
-    except Exception:
-        pass
+    with _cooldown_lock:
+        try:
+            tmp = Path(str(ALERT_COOLDOWN_FILE) + ".tmp")
+            tmp.write_text(json.dumps(cooldown, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(ALERT_COOLDOWN_FILE)
+        except Exception:
+            pass
 
 def is_in_cooldown(am_email: str, restaurant_norm: str, cooldown: dict) -> bool:
     key = f"{am_email}|{restaurant_norm}"
@@ -481,13 +524,13 @@ def is_in_cooldown(am_email: str, restaurant_norm: str, cooldown: dict) -> bool:
         return False
     try:
         last_sent = datetime.date.fromisoformat(last_sent_str)
-        return (datetime.date.today() - last_sent).days < COOLDOWN_DAYS
+        return (today_beograd() - last_sent).days < COOLDOWN_DAYS
     except Exception:
         return False
 
 def update_cooldown(am_email: str, restaurant_norm: str, cooldown: dict):
     key = f"{am_email}|{restaurant_norm}"
-    cooldown[key] = datetime.date.today().isoformat()
+    cooldown[key] = today_beograd().isoformat()
 
 # ─────────────────────────── KEEP-ALIVE PING ─────────────────────────────────
 
@@ -560,12 +603,19 @@ _fetch_log_lock = threading.Lock()
 _throttle_until = 0.0
 _throttle_lock  = threading.Lock()
 
+# ── Rotating log — max 5 MB, čuva 3 backup fajla ────────────────────────────
+_fetch_logger = logging.getLogger("fetch_debug")
+if not _fetch_logger.handlers:
+    _rh = RotatingFileHandler(
+        "_fetch_debug.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _rh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+    _fetch_logger.addHandler(_rh)
+    _fetch_logger.setLevel(logging.DEBUG)
+
 def _log_fetch(msg: str):
     try:
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        with _fetch_log_lock:
-            with open("_fetch_debug.log", "a", encoding="utf-8") as f:
-                f.write(f"[{ts}] {msg}\n")
+        _fetch_logger.debug(msg)
     except Exception:
         pass
 
@@ -1018,7 +1068,7 @@ def send_alert_email(am_email: str, am_name: str, alerts: list[dict]) -> bool:
             </tr>"""
         if not rows_html:
             return True
-        today_str = datetime.date.today().strftime("%d.%m.%Y")
+        today_str = today_beograd().strftime("%d.%m.%Y")
         html = f"""
         <html><body style='font-family:Arial,sans-serif;color:#222;max-width:720px;margin:auto'>
           <div style='background:#1a1a2e;padding:24px 32px;border-radius:12px 12px 0 0'>
@@ -1080,7 +1130,7 @@ def send_sales_bulk_notification(to_email: str, grad: str, novi_restorani: list)
               </td>
             </tr>"""
 
-        today_str = datetime.date.today().strftime("%d.%m.%Y")
+        today_str = today_beograd().strftime("%d.%m.%Y")
         html = f"""
         <html><body style='font-family:Arial,sans-serif;background:#f5f5f5;padding:20px'>
           <div style='max-width:680px;margin:auto;background:#fff;border-radius:12px;
@@ -1259,10 +1309,13 @@ def run_scheduled_scan_and_send():
 
 DAYS_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+# Fix 4: pamtimo kada je svaki grad poslednji put pokrenut
+_city_last_fired: dict[str, str] = {}  # city -> "YYYY-MM-DD HH:MM"
+
 def _scheduler_loop():
     while True:
         cfg = load_scheduler_config()
-        now = datetime.datetime.now()
+        now = now_beograd()
         slept = False
 
         # ── Global full scan ─────────────────────────────────────────────────
@@ -1280,43 +1333,49 @@ def _scheduler_loop():
         for city, cs in city_schedules.items():
             if not cs.get("enabled") or not cs.get("days"):
                 continue
-            now2 = datetime.datetime.now()
+            now2 = now_beograd()
             cur_day_short = DAYS_SHORT[now2.weekday()]
             if cur_day_short not in cs["days"]:
                 continue
             target_c = now2.replace(hour=cs["hour"], minute=cs["minute"], second=0, microsecond=0)
-            # Only fire if we're within 60 seconds past the target time
+            # Fix 4: koristimo last_fired da tačno jednom okidamo po zakazanom vremenu,
+            # bez obzira na kašnjenje servera ili restart
+            fire_key = target_c.strftime("%Y-%m-%d %H:%M")
+            if _city_last_fired.get(city) == fire_key:
+                continue  # već okidan za ovaj termin
             diff = (now2 - target_c).total_seconds()
-            if 0 <= diff < 60:
-                # Run city rescan
-                import logging
-                log = logging.getLogger("scheduler")
-                if not acquire_scan_lock():
-                    log.warning(f"[Scheduler-City] {city}: scan already running, skipping.")
-                    continue
-                stop_ev = threading.Event()
-                class NullPH:
-                    def info(self, *a, **kw): pass
-                    def warning(self, *a, **kw): pass
-                    def success(self, *a, **kw): pass
-                    def error(self, *a, **kw): pass
-                    def empty(self, *a, **kw): pass
-                try:
-                    prev_df = load_scan()
-                    new_city_df = scan_all_cities([city], NullPH(), stop_ev)
-                    if new_city_df is not None and not new_city_df.empty:
-                        if not prev_df.empty:
-                            other = prev_df[prev_df["grad"] != city]
-                            merged = pd.concat([other, new_city_df], ignore_index=True)
-                        else:
-                            merged = new_city_df
-                        save_scan(merged)
-                        log.info(f"[Scheduler-City] {city}: city rescan done, {len(new_city_df)} restaurants.")
-                except Exception as e:
-                    log.error(f"[Scheduler-City] {city}: error — {e}")
-                finally:
-                    release_scan_lock()
-                slept = True
+            if not (0 <= diff < 120):  # prozor 2 minuta umesto 60s
+                continue
+            _city_last_fired[city] = fire_key
+
+            import logging as _logging
+            log = _logging.getLogger("scheduler")
+            if not acquire_scan_lock():
+                log.warning(f"[Scheduler-City] {city}: scan already running, skipping.")
+                continue
+            stop_ev = threading.Event()
+            class NullPH:
+                def info(self, *a, **kw): pass
+                def warning(self, *a, **kw): pass
+                def success(self, *a, **kw): pass
+                def error(self, *a, **kw): pass
+                def empty(self, *a, **kw): pass
+            try:
+                prev_df = load_scan()
+                new_city_df = scan_all_cities([city], NullPH(), stop_ev)
+                if new_city_df is not None and not new_city_df.empty:
+                    if not prev_df.empty:
+                        other = prev_df[prev_df["grad"] != city]
+                        merged = pd.concat([other, new_city_df], ignore_index=True)
+                    else:
+                        merged = new_city_df
+                    save_scan(merged)
+                    log.info(f"[Scheduler-City] {city}: city rescan done, {len(new_city_df)} restaurants.")
+            except Exception as e:
+                log.error(f"[Scheduler-City] {city}: error — {e}")
+            finally:
+                release_scan_lock()
+            slept = True
 
         if not slept:
             time.sleep(60)
@@ -2091,7 +2150,7 @@ with tab_sched:
     # ── Status ───────────────────────────────────────────────────────────────
     cfg_cur = load_scheduler_config()
     if cfg_cur.get("enabled"):
-        now = datetime.datetime.now()
+        now = now_beograd()
         target = now.replace(hour=cfg_cur["hour"], minute=cfg_cur["minute"], second=0, microsecond=0)
         if now >= target:
             target += datetime.timedelta(days=1)
@@ -2107,7 +2166,7 @@ with tab_sched:
     active_city_scheds = {c: s for c, s in city_scheds_cur.items() if s.get("enabled") and s.get("days")}
     if active_city_scheds:
         st.markdown("**Active per-city schedules:**")
-        now = datetime.datetime.now()
+        now = now_beograd()
         cur_day_idx = now.weekday()  # 0=Mon
         day_idx = {d: i for i, d in enumerate(DAYS)}
         for city, cs in active_city_scheds.items():
@@ -2236,7 +2295,7 @@ with tab_reset:
         df_wolt_bk = st.session_state.df_wolt
         if not df_wolt_bk.empty:
             st.download_button("⬇️ Download scan CSV", df_wolt_bk.to_csv(index=False).encode("utf-8"),
-                               file_name=f"scan_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                               file_name=f"scan_backup_{now_beograd().strftime('%Y%m%d_%H%M')}.csv",
                                mime="text/csv", key="backup_scan_dl")
         amm_bk = load_amm()
         if not amm_bk.empty:
