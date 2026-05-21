@@ -38,12 +38,13 @@ EMAIL_PASSWORD = "sdehqzbnqefjlomo"
 
 GSHEET_ID = st.secrets["GSHEET_ID"]
 
-CITY_KEYS    = ["Beograd", "Novi Sad", "Nis", "Kragujevac"]
+CITY_KEYS    = ["Beograd", "Novi Sad", "Nis", "Kragujevac", "Novi Pazar"]
 CITY_DISPLAY = {
     "Beograd":    "Beograd",
     "Novi Sad":   "Novi Sad",
     "Nis":        "Niš",
     "Kragujevac": "Kragujevac",
+    "Novi Pazar": "Novi Pazar", 
 }
 CITIES = [CITY_DISPLAY[k] for k in CITY_KEYS]
 
@@ -117,6 +118,16 @@ CITY_MULTI_COORDS = {
     "Kragujevac": [
         (44.0128, 20.9114), (44.0000, 20.8900),
         (44.0300, 20.9300), (43.9900, 20.9400),
+    ],
+
+    "Novi Pazar": [
+        (43.1367, 20.5122),  # Centar — Trg palih boraca
+        (43.1420, 20.5200),  # Serverozapad — Jalija
+        (43.1300, 20.5050),  # Jug — Postenje
+        (43.1450, 20.5000),  # Zapad — Šestovo
+        (43.1250, 20.5250),  # Istok — Industrijaska zona
+        (43.1380, 20.4920),  # Severozapad — Trnava
+        (43.1180, 20.5150),  # Jug — Lukare
     ],
 }
 
@@ -572,6 +583,7 @@ CITY_SLUG_MAP = {
     "Novi Sad":   "novi-sad",
     "Nis":        "nis",
     "Kragujevac": "kragujevac",
+    "Novi Pazar": "novi-pazar",
 }
 
 def wolt_get(url: str) -> tuple:
